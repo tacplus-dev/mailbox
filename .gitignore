@@ -1,0 +1,27 @@
+# Build artifacts
+target/
+dist/
+
+# Generated code
+tacplus/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Claude Code
+.claude/
+proto

@@ -1,0 +1,31 @@
+[package]
+name = "mailbox"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+mailbox-model = { path = "target/generated-sources/model" }
+servicemanager = { path = "target/generated-sources/model/chassis/servicemanager" }
+logger = { path = "target/generated-sources/model/chassis/logger" }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["transport"] }
+tracing = "0.1"
+async-trait = "0.1"
+
+# Tests only, and the same three crates messaging's tests use, for the same
+# reason: the tests drive the GENERATED ValidationWrapper rather than the handler
+# trait, because the (spec.principal)/(spec.namespace) stamps and the
+# (spec.store_principal)/(spec.store_namespace) egress backstops are rendered in
+# that wrapper and in nothing else. Driving it means minting a bearer it can
+# parse (`key`, `token`) and absorbing the accounting it stamps (`am`). All three
+# are the same path dependencies mailbox-model itself uses, so they are the same
+# crates, not second copies.
+[dev-dependencies]
+# The RecordMeta the generated subscriber hands the handler carries a
+# well-known-type Timestamp, so a test that stands in for the subscriber has to
+# construct one. Same version the generated model crate pins, so it is the same
+# crate rather than a second copy of the type.
+prost-wkt-types = "0.7.1"
+token = { path = "target/generated-sources/model/chassis/token" }
+key = { path = "target/generated-sources/model/chassis/key" }
+am = { path = "target/generated-sources/model/chassis/am" }

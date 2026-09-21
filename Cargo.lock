@@ -1457,6 +1457,7 @@ dependencies = [
  "servicemanager",
  "spiffe",
  "tags",
+ "tinyvec",
  "token",
  "tokio",
  "tokio-rustls",

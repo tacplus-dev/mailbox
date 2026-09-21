@@ -65,9 +65,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let svc = Arc::new(service::MailboxService::new(state, publish));
 
-    // The eviction sweep. spawn_task ties it to the ServiceManager's lifecycle:
-    // it is aborted at shutdown and the SM waits for it, so a sweep in flight
-    // does not outlive the process that owns the state it is writing.
+    // The state-root sweep. spawn_task ties it to the ServiceManager's
+    // lifecycle: it is aborted at shutdown and the SM waits for it, so a sweep
+    // in flight does not outlive the process that owns the state it is
+    // deleting from.
     //
     // This is the fleet's only scheduling primitive and it is enough here, for
     // the reason `sweep_loop` gives: every action the sweep takes is idempotent

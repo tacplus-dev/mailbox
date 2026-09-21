@@ -1,4 +1,4 @@
-//! Round-trip, paired-control and eviction-sweep tests for the Mailbox service.
+//! Round-trip, paired-control and state-sweep tests for the Mailbox service.
 //!
 //! WHAT THESE DRIVE. Three seams, and the tests go through the real one in each
 //! case rather than around it:
@@ -20,10 +20,12 @@
 //!
 //! WHAT THESE DO NOT PROVE. The publisher is a capturing closure standing in for
 //! the generated EventBus publisher: it shows the real handler's real output —
-//! the actual `MailboxEntry` values, the actual count, the actual `ejectionable`
-//! transitions — but it cannot show that a broker accepted them, and it cannot
-//! show that the record store acts on `ejectionable` at all (nothing in the
-//! fleet does yet — see workers/big8-p1-mailbox-result.md §5).
+//! the actual `MailboxEntry` values and the actual count — but it cannot show
+//! that a broker accepted them. Nothing here can say anything about the record
+//! store's residency clock either: `(spec.record).residency` is a declaration
+//! the store acts on, with no runtime surface in this service to drive or
+//! observe. The per-row `ejectionable` gate these tests used to exercise was
+//! retired on 2026-09-20 (tacplus cd8829fb) and its tests went with it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -41,7 +43,6 @@ use mailbox_model::types::services::mailbox::mailbox_state_service_server::{
 use mailbox_model::types::services::mailbox::*;
 use mailbox_model::types::services::messaging::Message;
 use mailbox_model::types::sys::accounting::accounting::Event;
-use mailbox_model::types::sys::spec::spec::Ejectionable;
 use tonic::codegen::tokio_stream;
 use tonic::transport::Channel;
 
@@ -247,6 +248,17 @@ impl Authorizer for TokenAuthorizer {
     ) -> Result<HashMap<String, String>, tonic::Status> {
         Self::identity(authorization)
     }
+
+    // Signature-and-expiry only, per the trait's own contract. Same body as the
+    // other two here for the same reason they share one: this fixture's whole
+    // job is to turn a fixture bearer into a caller identity, and the three
+    // differ only in the checks a REAL authorizer layers on top of that.
+    async fn authenticate(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<HashMap<String, String>, tonic::Status> {
+        Self::identity(authorization)
+    }
 }
 
 /// An accounting `Sink` that keeps the events instead of publishing them.
@@ -391,16 +403,6 @@ impl Harness {
         self.kernel.entries.lock().unwrap().clone()
     }
 
-    /// Put a row straight into the store, bypassing the service. Used only to
-    /// age a row past a clock the test cannot wait out.
-    fn seed(&self, entry: MailboxEntry) {
-        self.kernel
-            .entries
-            .lock()
-            .unwrap()
-            .insert(entry.delivery_id.clone(), entry);
-    }
-
     /// Deliver one message on the consumer group, as the generated subscriber
     /// would. `at_ms` is the BROKER timestamp, which is what makes a replay
     /// deliver the same value twice.
@@ -479,9 +481,6 @@ async fn a_delivery_becomes_a_held_entry_on_the_same_key() {
     // The arrival clock is the BROKER's timestamp, not this process's.
     assert_eq!(row.held_since_ms, 1_700_000_100_000);
     assert_eq!(row.retrieved_at_ms, 0);
-
-    // HELD is NEVER-evict, stated rather than left at UNSPECIFIED.
-    assert_eq!(row.ejectionable, Ejectionable::Never as i32);
 
     // The summary line, and NOT the body. `text` has no field to land in — the
     // record has none — so this asserts the three that exist and that the
@@ -703,7 +702,7 @@ async fn update_held_mail_marks_retrieved_and_stamps_the_clock() {
 }
 
 /// IDEMPOTENT: a second call is a no-op, returns the id as NOT newly retrieved,
-/// and — the part that matters — does not push the eviction clock forward.
+/// and — the part that matters — does not rewrite `retrieved_at_ms`.
 #[tokio::test]
 async fn a_second_retrieval_is_a_no_op_and_does_not_move_the_clock() {
     let h = Harness::start().await;
@@ -1046,170 +1045,43 @@ async fn a_row_from_another_tenant_is_not_retrievable() {
 }
 
 // ---------------------------------------------------------------------------
-// The eviction sweep
+// The state-root sweep
 // ---------------------------------------------------------------------------
 
-/// A HELD row is NEVER-evict and the sweep does not touch it, at any age.
+/// The sweep leaves an unexpired row alone whatever its status: it has one
+/// predicate, `held_since_ms`, and the row below is 89 days old and unretrieved.
 ///
-/// This is the decision doc's rejected alternative ("residency clock keyed off
-/// held_since_ms") asserted as behaviour: the row below is 89 days old, older
-/// than any plausible residency window, and still unretrieved.
+/// Since 2026-09-20 this is the whole of the sweep's behaviour on a live row.
+/// Memory residency is the record store's, on a type-level clock declared in
+/// `(spec.record).residency`, and there is no per-row gate here to set.
 #[tokio::test]
-async fn the_sweep_never_marks_unretrieved_mail() {
+async fn the_sweep_leaves_an_unexpired_row_untouched() {
     let h = Harness::start().await;
     let eighty_nine_days_ago = now_ms() - 89 * 24 * 60 * 60 * 1000;
     h.deliver(delivery("m1", ALICE, TENANT), eighty_nine_days_ago)
         .await;
+    let published_before = h.published().len();
 
     let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.marked_evictable, 0);
     assert_eq!(outcome.expired, 0);
+    assert_eq!(outcome.scanned, 1);
 
     let row = h.row(&format!("m1/{ALICE}")).unwrap();
-    assert_eq!(row.ejectionable, Ejectionable::Never as i32);
     assert_eq!(row.status, MailboxEntryStatus::Held as i32);
-}
-
-/// At the default grace of 0, retrieval marks the gate INLINE — the mark and the
-/// retrieval are one write, so `(spec.store_epoch)` (what the residency window
-/// is measured against) starts at the retrieval instant and nowhere else.
-#[tokio::test]
-async fn retrieval_marks_the_row_evictable_inline_at_zero_grace() {
-    let h = Harness::start().await;
-    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
-        .await;
-
-    h.wrapper
-        .update_held_mail(Harness::signed(
-            UpdateHeldMailRequest {
-                delivery_ids: vec![format!("m1/{ALICE}")],
-                ..Default::default()
-            },
-            ALICE,
-            TENANT,
-        ))
-        .await
-        .expect("retrieve");
-
-    let row = h.row(&format!("m1/{ALICE}")).unwrap();
-    assert_eq!(row.ejectionable, Ejectionable::Window as i32);
-
-    // And the sweep then has nothing left to do.
-    let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.marked_evictable, 0);
-}
-
-/// With a grace period configured, retrieval leaves the row NEVER-evict and the
-/// SWEEP is what promotes it — once the grace has actually elapsed.
-#[tokio::test]
-async fn the_sweep_marks_a_retrieved_row_only_after_the_grace_period() {
-    let h = Harness::start().await;
-    h.svc.set_config(&mailbox::Config {
-        sweep_interval_seconds: 300,
-        retrieved_grace_seconds: 3600,
-        ..Default::default()
-    });
-    // A RECENT arrival: the sweep also expires rows at 90 days, and a
-    // fixture timestamp from 2023 would be swept away before this test could
-    // look at it.
-    h.deliver(delivery("m1", ALICE, TENANT), now_ms()).await;
-    let id = format!("m1/{ALICE}");
-
-    h.wrapper
-        .update_held_mail(Harness::signed(
-            UpdateHeldMailRequest {
-                delivery_ids: vec![id.clone()],
-                ..Default::default()
-            },
-            ALICE,
-            TENANT,
-        ))
-        .await
-        .expect("retrieve");
-
-    // Just retrieved: inside the grace, so still NEVER.
     assert_eq!(
-        h.row(&id).unwrap().ejectionable,
-        Ejectionable::Never as i32,
-        "a grace period means the row stays resident across it"
-    );
-    assert_eq!(h.svc.sweep_once().await.expect("sweep").marked_evictable, 0);
-
-    // Age the retrieval past the grace. The clock is retrieved_at_ms, exactly as
-    // the decision doc rules — held_since_ms is untouched here and stays recent.
-    let mut aged = h.row(&id).unwrap();
-    aged.retrieved_at_ms = now_ms() - 2 * 3600 * 1000;
-    h.seed(aged);
-
-    let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.marked_evictable, 1);
-    assert_eq!(h.row(&id).unwrap().ejectionable, Ejectionable::Window as i32);
-    assert_eq!(
-        h.row(&id).unwrap().status,
-        MailboxEntryStatus::Retrieved as i32,
-        "the sweep changes the GATE, not the status"
+        h.published().len(),
+        published_before,
+        "the sweep writes nothing to a row it does not expire"
     );
 }
 
-/// The sweep is the reconciler for a mark that never landed — the case the
-/// inline path cannot cover, because the process that would have marked it is
-/// gone.
+/// THE ONE PLACE THIS SERVICE DELETES ANYTHING: a row that reached
+/// `STATE_RETENTION_MS` leaves kernel state, so `MailboxState.entries` cannot
+/// grow past the bound it declares. Measured from `held_since_ms`, and it is now
+/// the only expiry in this record's life — `(spec.record).retention` was retired
+/// on 2026-09-20 and the record store deletes nothing.
 #[tokio::test]
-async fn the_sweep_repairs_a_retrieved_row_whose_mark_was_lost() {
-    let h = Harness::start().await;
-    // A RECENT arrival: the sweep also expires rows at 90 days, and a
-    // fixture timestamp from 2023 would be swept away before this test could
-    // look at it.
-    h.deliver(delivery("m1", ALICE, TENANT), now_ms()).await;
-    let id = format!("m1/{ALICE}");
-
-    // A row as an instance that died mid-retrieval would have left it:
-    // RETRIEVED, timestamped, but never marked.
-    let mut half_done = h.row(&id).unwrap();
-    half_done.status = MailboxEntryStatus::Retrieved as i32;
-    half_done.retrieved_at_ms = now_ms() - 60_000;
-    half_done.ejectionable = Ejectionable::Never as i32;
-    h.seed(half_done);
-
-    let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.marked_evictable, 1);
-    assert_eq!(h.row(&id).unwrap().ejectionable, Ejectionable::Window as i32);
-
-    // The repaired row was republished, so the record store learns the gate too.
-    let published = h.published();
-    assert_eq!(
-        published.last().unwrap().ejectionable,
-        Ejectionable::Window as i32
-    );
-}
-
-/// A RETRIEVED row with no timestamp cannot have its eligibility measured, so it
-/// stays NEVER. The safe direction for a value that cannot be computed is "keep
-/// the row" — the same reasoning EJECTIONABLE_UNSPECIFIED itself is built on.
-#[tokio::test]
-async fn a_retrieved_row_with_no_timestamp_stays_never_evict() {
-    let h = Harness::start().await;
-    // A RECENT arrival: the sweep also expires rows at 90 days, and a
-    // fixture timestamp from 2023 would be swept away before this test could
-    // look at it.
-    h.deliver(delivery("m1", ALICE, TENANT), now_ms()).await;
-    let id = format!("m1/{ALICE}");
-
-    let mut broken = h.row(&id).unwrap();
-    broken.status = MailboxEntryStatus::Retrieved as i32;
-    broken.retrieved_at_ms = 0;
-    h.seed(broken);
-
-    assert_eq!(h.svc.sweep_once().await.expect("sweep").marked_evictable, 0);
-    assert_eq!(h.row(&id).unwrap().ejectionable, Ejectionable::Never as i32);
-}
-
-/// THE ONE PLACE THIS SERVICE DELETES ANYTHING: a row that reached the record's
-/// own 90-day retention leaves kernel state, so `MailboxState.entries` cannot
-/// grow past the bound it declares. It is measured from held_since_ms, the same
-/// clock `(spec.record).retention` uses, so the two stores expire a row together.
-#[tokio::test]
-async fn the_sweep_expires_rows_at_the_records_own_retention_age() {
+async fn the_sweep_expires_rows_at_the_state_retention_age() {
     let h = Harness::start().await;
     let ninety_one_days_ago = now_ms() - 91 * 24 * 60 * 60 * 1000;
     h.deliver(delivery("m1", ALICE, TENANT), ninety_one_days_ago)
@@ -1228,21 +1100,16 @@ async fn the_sweep_expires_rows_at_the_records_own_retention_age() {
 #[tokio::test]
 async fn the_sweep_is_idempotent() {
     let h = Harness::start().await;
-    // A RECENT arrival: the sweep also expires rows at 90 days, and a
-    // fixture timestamp from 2023 would be swept away before this test could
-    // look at it.
-    h.deliver(delivery("m1", ALICE, TENANT), now_ms()).await;
-    let id = format!("m1/{ALICE}");
-    let mut retrieved = h.row(&id).unwrap();
-    retrieved.status = MailboxEntryStatus::Retrieved as i32;
-    retrieved.retrieved_at_ms = now_ms() - 60_000;
-    h.seed(retrieved);
+    let ninety_one_days_ago = now_ms() - 91 * 24 * 60 * 60 * 1000;
+    h.deliver(delivery("m1", ALICE, TENANT), ninety_one_days_ago)
+        .await;
+    h.deliver(delivery("m2", ALICE, TENANT), now_ms()).await;
 
     let first = h.svc.sweep_once().await.expect("sweep");
     let second = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(first.marked_evictable, 1);
-    assert_eq!(second.marked_evictable, 0);
+    assert_eq!(first.expired, 1);
     assert_eq!(second.expired, 0);
+    assert_eq!(second.scanned, 1, "the expired row is gone, not re-examined");
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,7 +1124,6 @@ async fn the_sweep_interval_comes_from_kernel_config() {
     assert_eq!(h.svc.sweep_interval(), std::time::Duration::from_secs(300));
     h.svc.set_config(&mailbox::Config {
         sweep_interval_seconds: 30,
-        retrieved_grace_seconds: 0,
         ..Default::default()
     });
     assert_eq!(h.svc.sweep_interval(), std::time::Duration::from_secs(30));

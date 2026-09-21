@@ -16,10 +16,22 @@
 //!      c2s query plane, and duplicating it here would create a second source of
 //!      truth for content this service has no business owning.
 //!
-//!   3. SWEEP. mailbox is the first consumer of `(spec.ejectionable)` (BIG GOAL
-//!      8 Phase 0 item 4), which landed as declaration-and-refusal plumbing with
-//!      no runtime consumer anywhere. See `sweep_once` for what "evict" turned
-//!      out to mean once read against the generator rather than against prose.
+//!   3. SWEEP. A timer that prunes THIS SERVICE'S OWN state root: rows whose
+//!      `held_since_ms` has reached `STATE_RETENTION_MS` leave
+//!      `MailboxState.entries`, because nothing else prunes it and a state root
+//!      that grows forever eventually hits its declared bound and refuses
+//!      writes. That is all the sweep does. See `sweep_once`.
+//!
+//! WHAT THE SWEEP USED TO ALSO DO, until 2026-09-20: flip a retrieved row's
+//! `ejectionable` marker from NEVER to WINDOW, gating whether the record store's
+//! memory-residency window applied to that row. tacplus cd8829fb retired
+//! `spec.Ejectionable` and the HOT/WARM/COLD model with it, and the one-clock
+//! replacement — `(spec.record).residency{idle_seconds, deleted_max_age_seconds}`
+//! on `MailboxEntry` — has no per-row half at all. Nothing was lost: eviction
+//! only ever removed a row from memory, leaving it complete and queryable on
+//! disk, so the NEVER pin on undelivered mail was protecting against something
+//! that does not hurt. This service now sets no residency policy per row and
+//! has no opinion about the store's memory.
 //!
 //! WHAT THIS SERVICE NEVER DOES: decide anything about a message. It copies
 //! four header fields and an id. `messaging.Message` is the primitive with no
@@ -40,7 +52,6 @@ use mailbox_model::types::services::mailbox::{
 };
 use mailbox_model::types::services::messaging::Message;
 use mailbox_model::types::sys::healthreport::healthreport::InstanceStatus;
-use mailbox_model::types::sys::spec::spec::Ejectionable;
 
 /// The publisher the generated ServiceManager hands over for the topic
 /// synthesized from `MailboxEntry`'s `spec.record`
@@ -49,8 +60,9 @@ use mailbox_model::types::sys::spec::spec::Ejectionable;
 /// Every row this service writes goes to TWO places and they are not
 /// interchangeable: kernel state is what this service reads back (see
 /// `MailboxState`'s comment in the proto for why it is not the record store),
-/// and the topic is what carries the row to the record store, where the
-/// residency window `ejectionable` gates actually lives.
+/// and the topic is what carries the row to the record store, where the row is
+/// durable, queryable by the record plane, and subject to the record's declared
+/// `residency` — a type-level clock this service neither sets nor observes.
 pub type MailboxEntryPublisher = Arc<
     dyn Fn(MailboxEntry) -> Result<(), tokio::sync::mpsc::error::TrySendError<MailboxEntry>>
         + Send
@@ -59,12 +71,14 @@ pub type MailboxEntryPublisher = Arc<
 
 /// How long a `MailboxEntry` row stays in kernel state, in milliseconds.
 ///
-/// 90 days, and NOT a config knob: it is `(spec.record).retention` on
-/// `MailboxEntry` restated in the one place that can act on it. Retention
-/// deletes the row in the RECORD STORE; nothing prunes this service's own state
-/// root, so the sweep does that half, from the same clock (`held_since_ms`) and
-/// at the same age. Two stores expiring a row at two different ages would leave
-/// an index entry pointing at a message that no longer exists, or the reverse.
+/// 90 days, and NOT a config knob: it is the same age `messaging.Message` keeps
+/// a delivery for, so this index can never outlive the record it indexes.
+///
+/// It used to be `(spec.record).retention` on `MailboxEntry` restated here; that
+/// annotation was retired on 2026-09-20 and nothing replaced it, so this is now
+/// the ONLY expiry anywhere in this record's life and it applies only to this
+/// service's own state root. The record store's copy is not deleted by anything
+/// — it ages out of memory on `residency.idle_seconds` and stays on disk.
 const STATE_RETENTION_MS: i64 = 7_776_000_000;
 
 pub struct MailboxService {
@@ -84,13 +98,11 @@ pub struct MailboxService {
     /// Kernel-delivered config. Held rather than read as constants so a change
     /// in kernel changes behaviour with no redeploy.
     sweep_interval_seconds: RwLock<i32>,
-    retrieved_grace_seconds: RwLock<i32>,
 
     /// Counters, for the shutdown line. Deliberately not per-recipient: nothing
     /// in this service logs a subject, a body or a principal.
     held: AtomicI64,
     retrieved: AtomicI64,
-    marked_evictable: AtomicI64,
     expired: AtomicI64,
 }
 
@@ -98,11 +110,8 @@ pub struct MailboxService {
 /// driven directly by a test and by an operator, not only by the timer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SweepOutcome {
-    /// Rows whose `ejectionable` moved NEVER -> WINDOW because they are
-    /// retrieved and past the grace period.
-    pub marked_evictable: usize,
-    /// Rows deleted from kernel state because they reached the record's own
-    /// retention age.
+    /// Rows deleted from kernel state because they reached
+    /// `STATE_RETENTION_MS`.
     pub expired: usize,
     /// Rows examined.
     pub scanned: usize,
@@ -117,10 +126,8 @@ impl MailboxService {
             // accepts traffic; the generated SM delivers config first. The
             // defaults match spec.default_int in the proto.
             sweep_interval_seconds: RwLock::new(300),
-            retrieved_grace_seconds: RwLock::new(0),
             held: AtomicI64::new(0),
             retrieved: AtomicI64::new(0),
-            marked_evictable: AtomicI64::new(0),
             expired: AtomicI64::new(0),
         }
     }
@@ -129,9 +136,9 @@ impl MailboxService {
         if let Ok(mut w) = self.sweep_interval_seconds.write() {
             *w = cfg.sweep_interval_seconds;
         }
-        if let Ok(mut w) = self.retrieved_grace_seconds.write() {
-            *w = cfg.retrieved_grace_seconds;
-        }
+        // `cfg.retrieved_grace_seconds` is deliberately not read: it deferred
+        // the retired eviction mark and gates nothing now. See its comment in
+        // mailbox.proto.
     }
 
     pub fn sweep_interval(&self) -> Duration {
@@ -145,20 +152,10 @@ impl MailboxService {
         Duration::from_secs(secs)
     }
 
-    fn retrieved_grace_ms(&self) -> i64 {
-        self.retrieved_grace_seconds
-            .read()
-            .map(|v| *v)
-            .unwrap_or(0)
-            .max(0) as i64
-            * 1000
-    }
-
-    pub fn counts(&self) -> (i64, i64, i64, i64) {
+    pub fn counts(&self) -> (i64, i64, i64) {
         (
             self.held.load(Ordering::Relaxed),
             self.retrieved.load(Ordering::Relaxed),
-            self.marked_evictable.load(Ordering::Relaxed),
             self.expired.load(Ordering::Relaxed),
         )
     }
@@ -167,12 +164,15 @@ impl MailboxService {
     ///
     /// STATE FIRST, deliberately. The state row is what `ListHeldMail` and
     /// `UpdateHeldMail` read, so it is the one that decides what a caller sees;
-    /// the published row is the copy the record store keeps and the residency
-    /// window applies to. If the publish fails, the caller-visible answer is
-    /// already correct and the sweep republishes the row on its next pass — a
-    /// row whose state says RETRIEVED but whose `ejectionable` is not yet WINDOW
-    /// is exactly the sweep's own predicate. If the STATE write fails there is
-    /// nothing to reconcile from, so that failure propagates.
+    /// the published row is the copy the record store keeps. If the publish
+    /// fails, the caller-visible answer is still correct and the row this
+    /// service serves from is intact — the store's copy is then behind by one
+    /// write until the next write to that row. If the STATE write fails there is
+    /// nothing to serve from at all, so that failure propagates.
+    ///
+    /// NOTE: the sweep no longer republishes anything, so a dropped publish is
+    /// not reconciled. That was true of the eviction-marker sweep and went away
+    /// with it; it is called out here rather than left as an assumption.
     async fn write(&self, entry: &MailboxEntry) -> Result<(), tonic::Status> {
         self.state
             .put_entries(entry.delivery_id.clone(), entry.clone())
@@ -190,48 +190,27 @@ impl MailboxService {
         Ok(())
     }
 
-    /// One eviction-eligibility pass. THE ANSWER TO WHAT "EVICT" MEANS HERE.
+    /// One state-root expiry pass, and the only place this service deletes
+    /// anything.
     ///
-    /// Read against the generator rather than against the decision doc's prose,
-    /// `(spec.ejectionable)` turned out not to be a delete marker at all:
-    ///
-    ///   - `(spec.record).residency` declares a MEMORY window for a record TYPE,
-    ///     and `Residency`'s own definition says "a warm row evicted from memory
-    ///     is still complete and queryable on disk". Eviction is cache
-    ///     maintenance. It destroys nothing.
-    ///   - `(spec.ejectionable)` names the field whose per-row value decides
-    ///     whether that window is consulted for a given row, with
-    ///     EJECTIONABLE_UNSPECIFIED defined as never-evict so the marker an
-    ///     author forgets keeps the row.
-    ///   - Deletion is `(spec.record).retention`'s job, from a different clock.
-    ///
-    /// So this sweep does not delete a retrieved row and does not move it to a
-    /// terminal state. It sets the gate — and only mailbox can, because only
-    /// mailbox knows that a delivery has been pulled. THE MARK IS A WRITE, which
-    /// matters: `(spec.store_epoch)` is stamped on every write and is what the
-    /// residency window is measured against, so marking a row WINDOW is also
-    /// what starts its clock. With `retrieved_grace_seconds` at its default 0
-    /// the mark lands at the retrieval instant, which is the decision doc's
-    /// ruling — "retrieved_at_ms is the point eviction eligibility starts
-    /// counting from" — expressed through the mechanism the annotation has.
-    ///
-    /// A HELD row is never touched. That is the doc's rejected alternative
-    /// ("residency clock keyed off held_since_ms") and the enum's own worked
-    /// example ("a mailbox's undelivered message" is the row that must not leave
-    /// memory), and it is enforced by predicate here, not by comment.
-    ///
-    /// THE SECOND HALF, and the only place this service deletes anything: a row
-    /// whose `held_since_ms` has reached the record's own 90-day retention is
-    /// removed from kernel state. The record store expires its copy on that
-    /// clock by declaration; nothing else prunes this service's state root, so
+    /// A row whose `held_since_ms` has reached `STATE_RETENTION_MS` is removed
+    /// from kernel state. Nothing else prunes this service's state root, so
     /// leaving it out would make `MailboxState.entries` grow until it hit its
     /// declared 1,000,000 bound and started refusing writes.
+    ///
+    /// IT TOUCHES NOTHING IN THE RECORD STORE, and there is no second half any
+    /// more. Until 2026-09-20 this loop also flipped a retrieved row's
+    /// `ejectionable` marker to WINDOW so the store's residency window would
+    /// apply to it; `spec.Ejectionable` was retired (tacplus cd8829fb) and the
+    /// one-clock model that replaced it is declared per TYPE on `MailboxEntry`
+    /// and has no per-row gate to set. A HELD row nobody reads now simply ages
+    /// out of the store's memory and stays complete and queryable on disk, which
+    /// is what the old NEVER was pinning it against.
     ///
     /// It is idempotent and safe to run at any time from any instance: every
     /// change it makes is a fixed function of the row it reads.
     pub async fn sweep_once(&self) -> Result<SweepOutcome, tonic::Status> {
         let now = now_ms();
-        let grace_ms = self.retrieved_grace_ms();
         let entries = self.state.fetch_all_entries().await?;
 
         let mut outcome = SweepOutcome {
@@ -240,37 +219,16 @@ impl MailboxService {
         };
 
         for (key, entry) in entries {
-            // Expiry first: a row old enough to leave state does not also need
-            // its gate corrected on the way out.
+            // `status` is deliberately not consulted: a delivery nobody ever
+            // pulled expires from this root at the same age as one that was
+            // pulled, because the bound this protects is the root's size and a
+            // held row occupies exactly as much of it.
             if entry.held_since_ms > 0 && now.saturating_sub(entry.held_since_ms) >= STATE_RETENTION_MS
             {
                 self.state.delete_entries(key).await?;
                 self.expired.fetch_add(1, Ordering::Relaxed);
                 outcome.expired += 1;
-                continue;
             }
-
-            if entry.status != MailboxEntryStatus::Retrieved as i32 {
-                continue;
-            }
-            if entry.ejectionable == Ejectionable::Window as i32 {
-                continue;
-            }
-            // A RETRIEVED row with no timestamp cannot have its eligibility
-            // measured, so it stays NEVER. Not an error: it is the safe
-            // direction, and the row is visible to whoever wants to ask why.
-            if entry.retrieved_at_ms <= 0 {
-                continue;
-            }
-            if now.saturating_sub(entry.retrieved_at_ms) < grace_ms {
-                continue;
-            }
-
-            let mut marked = entry;
-            marked.ejectionable = Ejectionable::Window as i32;
-            self.write(&marked).await?;
-            self.marked_evictable.fetch_add(1, Ordering::Relaxed);
-            outcome.marked_evictable += 1;
         }
 
         Ok(outcome)
@@ -293,19 +251,18 @@ impl MailboxService {
         loop {
             tokio::time::sleep(self.sweep_interval()).await;
             match self.sweep_once().await {
-                Ok(o) if o.marked_evictable > 0 || o.expired > 0 => {
+                Ok(o) if o.expired > 0 => {
                     tracing::info!(
                         scanned = o.scanned,
-                        marked_evictable = o.marked_evictable,
                         expired = o.expired,
-                        "mailbox eviction sweep"
+                        "mailbox state sweep"
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
                     // A failed pass is not fatal: the next one re-derives
                     // everything from state.
-                    tracing::error!(error = %e, "mailbox eviction sweep failed");
+                    tracing::error!(error = %e, "mailbox state sweep failed");
                 }
             }
         }
@@ -380,10 +337,6 @@ impl MailboxService {
             sender: msg.sender,
             subject: msg.subject,
             sent_at_ms: msg.sent_at_ms,
-            // HELD is NEVER-evict, stated explicitly rather than left at
-            // UNSPECIFIED. Both mean the same thing to the store; only one of
-            // them says the row was thought about.
-            ejectionable: Ejectionable::Never as i32,
             // store_epoch_ms and spiffe_id are STAMPED — by the generated
             // wrapper and by eventbus respectively — and writing either here
             // would be this service asserting a value nothing verified.
@@ -452,7 +405,6 @@ impl MailboxHandler for MailboxService {
         // sent_at_ms for a whole submission: these ids were acknowledged by one
         // act and must not disagree about when.
         let now = now_ms();
-        let grace_ms = self.retrieved_grace_ms();
         let entries = self.state.fetch_all_entries().await?;
 
         let mut retrieved_delivery_ids = Vec::new();
@@ -472,8 +424,8 @@ impl MailboxHandler for MailboxService {
             }
             // IDEMPOTENT. Already retrieved is a no-op and NOT an error: a
             // client polling on reconnect must not fail on ids it already acked,
-            // and re-stamping retrieved_at_ms would push the eviction clock
-            // forward every time it asked.
+            // and re-stamping retrieved_at_ms would rewrite when the recipient
+            // took the mail every time it asked.
             if entry.status != MailboxEntryStatus::Held as i32 {
                 continue;
             }
@@ -481,18 +433,6 @@ impl MailboxHandler for MailboxService {
             let mut updated = entry.clone();
             updated.status = MailboxEntryStatus::Retrieved as i32;
             updated.retrieved_at_ms = now;
-            // Mark the gate INLINE when there is no grace to wait out. The sweep
-            // would get to it, but a row that is eligible the moment it is
-            // retrieved should say so in the same write that retrieved it —
-            // otherwise its (spec.store_epoch), which is what the residency
-            // window measures, would start at the sweep's clock instead of the
-            // retrieval's. With a non-zero grace the sweep owns the mark, which
-            // is the whole reason the grace knob and the sweep are one design.
-            if grace_ms == 0 {
-                updated.ejectionable = Ejectionable::Window as i32;
-                self.marked_evictable.fetch_add(1, Ordering::Relaxed);
-            }
-
             self.write(&updated).await?;
             self.retrieved.fetch_add(1, Ordering::Relaxed);
             retrieved_delivery_ids.push(delivery_id.clone());
@@ -545,7 +485,6 @@ impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
         self.svc.set_config(cfg);
         tracing::info!(
             sweep_interval_seconds = cfg.sweep_interval_seconds,
-            retrieved_grace_seconds = cfg.retrieved_grace_seconds,
             "mailbox config applied"
         );
         Ok(())
@@ -567,13 +506,7 @@ impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
     }
 
     async fn shutdown(&self) {
-        let (held, retrieved, marked, expired) = self.svc.counts();
-        tracing::info!(
-            held,
-            retrieved,
-            marked_evictable = marked,
-            expired,
-            "mailbox shutting down"
-        );
+        let (held, retrieved, expired) = self.svc.counts();
+        tracing::info!(held, retrieved, expired, "mailbox shutting down");
     }
 }

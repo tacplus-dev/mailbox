@@ -45,11 +45,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // that makes this service a consumer group, and blocks until shutdown.
     let sm = Arc::new(ServiceManager::new().await?);
 
-    // The state client is generated and owned by the ServiceManager: already
-    // connected, already authorized, already watching every boundary by the time
-    // this line runs. Cloning the handle is the whole of "wire up state access".
-    let state = sm.state_clients().services().mailbox_state().clone();
-
     // The record topic is SYNTHESIZED from MailboxEntry's spec.record, so its
     // publisher factory is named after the generated wrapper (MailboxEntryBus)
     // and its field (stream), not after anything hand-written. Acquired before
@@ -63,21 +58,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // (spec.event_watch) declaration in the proto.
     let publish = sm.create_mailbox_mailbox_entry_bus_stream_publisher().await;
 
-    let svc = Arc::new(service::MailboxService::new(state, publish));
+    // The READ half, and the whole of "wire up storage" since 2026-09-27: the
+    // ServiceManager owns the record plane's client, generated because
+    // mailbox.proto declares (spec.record_read) over MailboxEntry. There is no
+    // state client here any more — mailbox has no kernel state root.
+    let rows = Arc::new(service::RecordPlaneRows(sm.clone()));
 
-    // The state-root sweep. spawn_task ties it to the ServiceManager's
-    // lifecycle: it is aborted at shutdown and the SM waits for it, so a sweep
-    // in flight does not outlive the process that owns the state it is
-    // deleting from.
-    //
-    // This is the fleet's only scheduling primitive and it is enough here, for
-    // the reason `sweep_loop` gives: every action the sweep takes is idempotent
-    // and derived from the row it reads, so two instances running it concurrently
-    // agree and a missed pass is picked up by the next one.
-    let sweeper = svc.clone();
-    sm.spawn_task(async move { sweeper.sweep_loop().await });
-
+    let svc = Arc::new(service::MailboxService::new(rows, publish));
     let handler = Arc::new(service::MailboxServiceHandler::new(svc));
 
+    // No sweep task. The timer that used to run here pruned MailboxState in
+    // kernel; there is no such root, and nothing in the record store is this
+    // service's to delete (see Config.sweep_interval_seconds in the proto).
     sm.run(handler).await
 }

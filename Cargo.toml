@@ -21,6 +21,12 @@ async-trait = "0.1"
 # are the same path dependencies mailbox-model itself uses, so they are the same
 # crates, not second copies.
 [dev-dependencies]
+# Paused time, for the read-after-write tests. `#[tokio::test(start_paused)]` is
+# gated behind tokio's `test-util` feature, and the visibility bound
+# (VISIBILITY_TIMEOUT) is seconds long — waiting it out for real would put a
+# multi-second sleep in the suite for every test that asserts the bound.
+tokio = { version = "1", features = ["full", "test-util"] }
+
 # The RecordMeta the generated subscriber hands the handler carries a
 # well-known-type Timestamp, so a test that stands in for the subscriber has to
 # construct one. Same version the generated model crate pins, so it is the same

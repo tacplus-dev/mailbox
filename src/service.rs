@@ -1,37 +1,40 @@
 //! The Mailbox service handler.
 //!
-//! Three jobs, and the third is the one nothing in the fleet had done before.
+//! Two jobs. There used to be three.
 //!
 //!   1. CONSUME. mailbox is a third consumer group on
 //!      `messaging.MessageBus.stream`. Every delivery messaging publishes lands
 //!      here as its own full copy — that fan-out is free and arranged entirely
 //!      by `s2s_subscribe` on `messaging.Message`, so it appears nowhere in this
 //!      file except as the handler method the generated `Handler` trait declares.
-//!      On receipt this service writes a HELD `MailboxEntry` keyed by the SAME
+//!      On receipt this service publishes a HELD `MailboxEntry` keyed by the SAME
 //!      `delivery_id`, holding no message body.
 //!
 //!   2. SERVE. `ListHeldMail` answers "do I have new mail"; `UpdateHeldMail`
 //!      marks deliveries retrieved. Neither returns a body: `messaging.Message`
-//!      already owns and serves that, with its own 90-day retention and its own
-//!      c2s query plane, and duplicating it here would create a second source of
-//!      truth for content this service has no business owning.
+//!      already owns and serves that, with its own c2s query plane, and
+//!      duplicating it here would create a second source of truth for content
+//!      this service has no business owning.
 //!
-//!   3. SWEEP. A timer that prunes THIS SERVICE'S OWN state root: rows whose
-//!      `held_since_ms` has reached `STATE_RETENTION_MS` leave
-//!      `MailboxState.entries`, because nothing else prunes it and a state root
-//!      that grows forever eventually hits its declared bound and refuses
-//!      writes. That is all the sweep does. See `sweep_once`.
+//! WHAT WENT AWAY on 2026-09-27, and it is the whole shape of this file:
+//! `MailboxState` in kernel. Rows are `MailboxEntry` in stratum and nothing
+//! else — written by publishing onto the record's own topic, read back through
+//! the generated `MailboxEntryRecordReader` that `(spec.record_read)` in
+//! mailbox.proto pairs with the record's `s2s_read` grant. There is no mirror,
+//! no cache and no second copy, so there is no ordering question between two
+//! stores and no sweep: the third job this file used to have was pruning the
+//! kernel state root, a bound that no longer exists (see
+//! `Config.sweep_interval_seconds` in the proto — it is inert, and nothing
+//! deletes a mailbox entry now).
 //!
-//! WHAT THE SWEEP USED TO ALSO DO, until 2026-09-20: flip a retrieved row's
-//! `ejectionable` marker from NEVER to WINDOW, gating whether the record store's
-//! memory-residency window applied to that row. tacplus cd8829fb retired
-//! `spec.Ejectionable` and the HOT/WARM/COLD model with it, and the one-clock
-//! replacement — `(spec.record).residency{idle_seconds, deleted_max_age_seconds}`
-//! on `MailboxEntry` — has no per-row half at all. Nothing was lost: eviction
-//! only ever removed a row from memory, leaving it complete and queryable on
-//! disk, so the NEVER pin on undelivered mail was protecting against something
-//! that does not hurt. This service now sets no residency policy per row and
-//! has no opinion about the store's memory.
+//! READ-YOUR-OWN-WRITE is the one thing the store does not give for free: a
+//! record's write path is a publish and stratum's asynchronous ingest of it. So
+//! `UpdateHeldMail` publishes and then POINT-READS THE ROW BACK until it sees
+//! its own write, bounded to `VISIBILITY_TIMEOUT`, before it answers the caller.
+//! That is what makes the `ListHeldMail` a client issues immediately afterwards
+//! correct. The consume path deliberately does not wait — nothing reads those
+//! rows back in the same breath, and waiting per message would put an ingest
+//! round trip in front of every delivery.
 //!
 //! WHAT THIS SERVICE NEVER DOES: decide anything about a message. It copies
 //! four header fields and an id. `messaging.Message` is the primitive with no
@@ -43,92 +46,156 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::mailbox::MailboxHandler;
-use mailbox_model::s2sm::internal::state::services::mailbox_state::state::MailboxStateClient;
 use mailbox_model::types::generated::eventbus_support::eventbus_support::RecordMeta;
 use mailbox_model::types::services::mailbox::mailbox::Config as MailboxConfig;
 use mailbox_model::types::services::mailbox::{
-    MailboxEntryStatus, ListHeldMailRequest, ListHeldMailResponse, MailboxEntry,
+    ListHeldMailRequest, ListHeldMailResponse, MailboxEntry, MailboxEntryStatus,
     UpdateHeldMailRequest, UpdateHeldMailResponse,
 };
 use mailbox_model::types::services::messaging::Message;
 use mailbox_model::types::sys::healthreport::healthreport::InstanceStatus;
+use mailbox_model::types::vservices::query::MailboxEntryFilter;
+
+/// The two reads this service makes of its own rows.
+///
+/// A SEAM, and the same one letsencrypt's `certRecordStore` is: the record plane
+/// is reachable only through a live client, the generated
+/// `MailboxEntryRecordReader` BORROWS that client from whatever owns it, and the
+/// full `RecordMap` server trait a test would otherwise have to stand up is 112
+/// methods over every record in the fleet. So the shape of the read is declared
+/// here, the production implementation below is the only place the generated
+/// reader is named, and the tests substitute a store of their own.
+///
+/// Nothing wider than the two questions this service asks: give me this row, give
+/// me the rows for this recipient.
+#[async_trait::async_trait]
+pub trait MailboxEntryRows: Send + Sync {
+    /// One row by record key, or `None` when the store holds none. A miss is an
+    /// ordinary answer: "no such delivery" and "the store is unreachable" must
+    /// not look alike to the callers below.
+    async fn get(&self, delivery_id: &str) -> Result<Option<MailboxEntry>, tonic::Status>;
+
+    /// One page of rows matching `filter`, with the next page token (empty on the
+    /// last page).
+    async fn list(
+        &self,
+        filter: MailboxEntryFilter,
+        page_size: i32,
+        page_token: String,
+    ) -> Result<(Vec<MailboxEntry>, String), tonic::Status>;
+}
+
+/// The production store: the record plane, through the generated reader.
+///
+/// Nothing here constructs a client, names stratum, opens or closes a query, or
+/// acquires a token for the `query` audience. `(spec.record_read)` in
+/// mailbox.proto is what caused the client to be generated and wired;
+/// `sm.mailbox_entry_record_reader()` is the generated accessor; and the
+/// three-call `Create -> List -> Delete` lifecycle (with the handle released on
+/// the failure path too) is inside the reader.
+pub struct RecordPlaneRows(pub Arc<mailbox_model::s2sm::ServiceManager>);
+
+#[async_trait::async_trait]
+impl MailboxEntryRows for RecordPlaneRows {
+    async fn get(&self, delivery_id: &str) -> Result<Option<MailboxEntry>, tonic::Status> {
+        self.0.mailbox_entry_record_reader().get(delivery_id).await
+    }
+
+    async fn list(
+        &self,
+        filter: MailboxEntryFilter,
+        page_size: i32,
+        page_token: String,
+    ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
+        let (rows, next, _total) = self
+            .0
+            .mailbox_entry_record_reader()
+            .list(Some(filter), page_size, page_token)
+            .await?;
+        Ok((rows, next))
+    }
+}
 
 /// The publisher the generated ServiceManager hands over for the topic
 /// synthesized from `MailboxEntry`'s `spec.record`
 /// (`mailbox.MailboxEntryBus.stream`).
 ///
-/// Every row this service writes goes to TWO places and they are not
-/// interchangeable: kernel state is what this service reads back (see
-/// `MailboxState`'s comment in the proto for why it is not the record store),
-/// and the topic is what carries the row to the record store, where the row is
-/// durable, queryable by the record plane, and subject to the record's declared
-/// `residency` — a type-level clock this service neither sets nor observes.
+/// This is the ONLY write path a record has: a record declares no write RPC, and
+/// reaches the store on stratum's own subscription to this topic. So publishing
+/// here IS writing the row, and a publish this service cannot enqueue is a write
+/// it did not perform — which is why, unlike the old two-store shape, a failure
+/// from this closure is returned to the caller rather than logged.
 pub type MailboxEntryPublisher = Arc<
     dyn Fn(MailboxEntry) -> Result<(), tokio::sync::mpsc::error::TrySendError<MailboxEntry>>
         + Send
         + Sync,
 >;
 
-/// How long a `MailboxEntry` row stays in kernel state, in milliseconds.
+/// How long a caller-facing write waits for its own row to become readable.
 ///
-/// 90 days, and NOT a config knob: it is the same age `messaging.Message` keeps
-/// a delivery for, so this index can never outlive the record it indexes.
+/// The publish hands the row to eventbus and stratum ingests it; Jody's
+/// measure of that hop is milliseconds, so this is a generous ceiling rather
+/// than an expected wait — the poll below returns as soon as the row is visible.
+/// Exceeding it is reported as a FAILED SAVE: the publish will still land, but a
+/// client told "retrieved" and then handed the same mail again by the next
+/// `ListHeldMail` is the one outcome this must not produce.
 ///
-/// It used to be `(spec.record).retention` on `MailboxEntry` restated here; that
-/// annotation was retired on 2026-09-20 and nothing replaced it, so this is now
-/// the ONLY expiry anywhere in this record's life and it applies only to this
-/// service's own state root. The record store's copy is not deleted by anything
-/// — it ages out of memory on `residency.idle_seconds` and stays on disk.
-const STATE_RETENTION_MS: i64 = 7_776_000_000;
+/// If this ever proves too tight in practice the answer is not a bigger number
+/// here: it is the synchronous publish-and-read helper the record plane would
+/// grow, generically, per the 2026-09-27 decision.
+const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the visibility poll re-reads. Short enough that the common case
+/// costs one extra point read, long enough that a slow ingest is not a busy loop.
+const VISIBILITY_POLL: Duration = Duration::from_millis(20);
+
+/// Rows per page when scanning a recipient's mailbox, and the cap on how many
+/// pages one `ListHeldMail` will walk.
+///
+/// The predicate the plane can be given is `recipient` (the record's only EQ
+/// criterion that names a person); HELD-ness is not a `(spec.query_field)` and
+/// deliberately is not one, so the status filter is applied here, over pages. A
+/// recipient with a long retrieved history therefore needs more than one page to
+/// yield 100 held rows, and the page cap is what keeps that read bounded instead
+/// of walking a mailbox of any size. Hitting it means a caller sees fewer than
+/// the rows that exist, which is the same thing pagination already means.
+const SCAN_PAGE_SIZE: i32 = 200;
+const MAX_SCAN_PAGES: usize = 25;
 
 pub struct MailboxService {
-    /// The generated state client — already connected, already authorized,
-    /// already watching, by the time this service is constructed. Every read
-    /// below is `fetch_all_entries`, the authoritative gRPC read, rather than
-    /// the locally cached `get_entries_map`: a mailbox answering "is this
-    /// already retrieved" off a cache that a Watch has not caught up on would
-    /// hand out mail twice.
-    state: MailboxStateClient,
+    /// The record plane, for every read this service performs. Reads are
+    /// authoritative by construction now: there is no local cache to be stale
+    /// against, because the store is the only copy.
+    rows: Arc<dyn MailboxEntryRows>,
 
     /// The record topic. The ONLY path by which a row leaves this service, and
     /// no EventBus client, topic name or token acquisition appears anywhere in
     /// this file because all three are inside this generated closure.
     publish: MailboxEntryPublisher,
 
-    /// Kernel-delivered config. Held rather than read as constants so a change
-    /// in kernel changes behaviour with no redeploy.
+    /// Kernel-delivered config, held so a change in kernel takes effect with no
+    /// redeploy. `sweep_interval_seconds` is the only field left and it is inert
+    /// (see the proto): it is retained here so that `mailbox_config` has
+    /// something truthful to log, and read by nothing.
     sweep_interval_seconds: RwLock<i32>,
 
     /// Counters, for the shutdown line. Deliberately not per-recipient: nothing
     /// in this service logs a subject, a body or a principal.
     held: AtomicI64,
     retrieved: AtomicI64,
-    expired: AtomicI64,
-}
-
-/// What one sweep pass did. Returned rather than only logged so the sweep can be
-/// driven directly by a test and by an operator, not only by the timer.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SweepOutcome {
-    /// Rows deleted from kernel state because they reached
-    /// `STATE_RETENTION_MS`.
-    pub expired: usize,
-    /// Rows examined.
-    pub scanned: usize,
 }
 
 impl MailboxService {
-    pub fn new(state: MailboxStateClient, publish: MailboxEntryPublisher) -> Self {
+    pub fn new(rows: Arc<dyn MailboxEntryRows>, publish: MailboxEntryPublisher) -> Self {
         Self {
-            state,
+            rows,
             publish,
             // Overwritten by the first `mailbox_config` call before the server
             // accepts traffic; the generated SM delivers config first. The
-            // defaults match spec.default_int in the proto.
+            // default matches spec.default_int in the proto.
             sweep_interval_seconds: RwLock::new(300),
             held: AtomicI64::new(0),
             retrieved: AtomicI64::new(0),
-            expired: AtomicI64::new(0),
         }
     }
 
@@ -136,136 +203,104 @@ impl MailboxService {
         if let Ok(mut w) = self.sweep_interval_seconds.write() {
             *w = cfg.sweep_interval_seconds;
         }
-        // `cfg.retrieved_grace_seconds` is deliberately not read: it deferred
-        // the retired eviction mark and gates nothing now. See its comment in
-        // mailbox.proto.
+        // Neither config field is read for behaviour any more:
+        // `sweep_interval_seconds` paced a state-root sweep that no longer
+        // exists, and `retrieved_grace_seconds` deferred an eviction mark
+        // retired on 2026-09-20. Both are documented as inert in the proto.
     }
 
-    pub fn sweep_interval(&self) -> Duration {
-        // A poisoned lock must not take the service down over a cadence.
-        let secs = self
-            .sweep_interval_seconds
-            .read()
-            .map(|v| *v)
-            .unwrap_or(300)
-            .max(1) as u64;
-        Duration::from_secs(secs)
+    pub fn sweep_interval_seconds(&self) -> i32 {
+        self.sweep_interval_seconds.read().map(|v| *v).unwrap_or(300)
     }
 
-    pub fn counts(&self) -> (i64, i64, i64) {
+    pub fn counts(&self) -> (i64, i64) {
         (
             self.held.load(Ordering::Relaxed),
             self.retrieved.load(Ordering::Relaxed),
-            self.expired.load(Ordering::Relaxed),
         )
     }
 
-    /// Write one row to both places, state first.
+    /// Enqueue one row onto the record topic.
     ///
-    /// STATE FIRST, deliberately. The state row is what `ListHeldMail` and
-    /// `UpdateHeldMail` read, so it is the one that decides what a caller sees;
-    /// the published row is the copy the record store keeps. If the publish
-    /// fails, the caller-visible answer is still correct and the row this
-    /// service serves from is intact — the store's copy is then behind by one
-    /// write until the next write to that row. If the STATE write fails there is
-    /// nothing to serve from at all, so that failure propagates.
-    ///
-    /// NOTE: the sweep no longer republishes anything, so a dropped publish is
-    /// not reconciled. That was true of the eviction-marker sweep and went away
-    /// with it; it is called out here rather than left as an assumption.
-    async fn write(&self, entry: &MailboxEntry) -> Result<(), tonic::Status> {
-        self.state
-            .put_entries(entry.delivery_id.clone(), entry.clone())
-            .await?;
-        if let Err(e) = (self.publish)(entry.clone()) {
-            // Not an error to the caller: the publish queue being full does not
-            // make the mailbox's own answer wrong, and the sweep is the
-            // reconciler for exactly this. Logged with the id and nothing else.
-            tracing::warn!(
+    /// A `TrySendError` means the row was NOT accepted for delivery, which since
+    /// there is no second store means the write did not happen. It is therefore
+    /// an error to whoever asked for it, not a warning — the previous shape could
+    /// swallow it because kernel state had already recorded the truth.
+    fn publish_row(&self, entry: &MailboxEntry) -> Result<(), tonic::Status> {
+        (self.publish)(entry.clone()).map_err(|e| {
+            tracing::error!(
                 error = %e,
                 delivery_id = %entry.delivery_id,
-                "mailbox entry publish queue full; state written, record deferred to the sweep"
+                "mailbox entry publish queue full; the row was not written"
             );
-        }
-        Ok(())
+            tonic::Status::unavailable("mailbox entry could not be queued for the record store")
+        })
     }
 
-    /// One state-root expiry pass, and the only place this service deletes
-    /// anything.
+    /// Publish a row and wait until the store will hand it back.
     ///
-    /// A row whose `held_since_ms` has reached `STATE_RETENTION_MS` is removed
-    /// from kernel state. Nothing else prunes this service's state root, so
-    /// leaving it out would make `MailboxState.entries` grow until it hit its
-    /// declared 1,000,000 bound and started refusing writes.
-    ///
-    /// IT TOUCHES NOTHING IN THE RECORD STORE, and there is no second half any
-    /// more. Until 2026-09-20 this loop also flipped a retrieved row's
-    /// `ejectionable` marker to WINDOW so the store's residency window would
-    /// apply to it; `spec.Ejectionable` was retired (tacplus cd8829fb) and the
-    /// one-clock model that replaced it is declared per TYPE on `MailboxEntry`
-    /// and has no per-row gate to set. A HELD row nobody reads now simply ages
-    /// out of the store's memory and stays complete and queryable on disk, which
-    /// is what the old NEVER was pinning it against.
-    ///
-    /// It is idempotent and safe to run at any time from any instance: every
-    /// change it makes is a fixed function of the row it reads.
-    pub async fn sweep_once(&self) -> Result<SweepOutcome, tonic::Status> {
-        let now = now_ms();
-        let entries = self.state.fetch_all_entries().await?;
-
-        let mut outcome = SweepOutcome {
-            scanned: entries.len(),
-            ..Default::default()
+    /// `settled` decides what "back" means: the poll reads the row by key and
+    /// accepts it once the predicate holds, so a caller says what it wrote rather
+    /// than comparing whole rows (the stored copy carries `store_epoch_ms` and
+    /// `spiffe_id` this service never set, so an equality test would never pass).
+    async fn publish_and_confirm(
+        &self,
+        entry: &MailboxEntry,
+        settled: impl Fn(&MailboxEntry) -> bool,
+    ) -> Result<(), tonic::Status> {
+        self.publish_row(entry)?;
+        let poll = async {
+            loop {
+                if let Some(row) = self.rows.get(&entry.delivery_id).await? {
+                    if settled(&row) {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(VISIBILITY_POLL).await;
+            }
         };
-
-        for (key, entry) in entries {
-            // `status` is deliberately not consulted: a delivery nobody ever
-            // pulled expires from this root at the same age as one that was
-            // pulled, because the bound this protects is the root's size and a
-            // held row occupies exactly as much of it.
-            if entry.held_since_ms > 0 && now.saturating_sub(entry.held_since_ms) >= STATE_RETENTION_MS
-            {
-                self.state.delete_entries(key).await?;
-                self.expired.fetch_add(1, Ordering::Relaxed);
-                outcome.expired += 1;
-            }
-        }
-
-        Ok(outcome)
+        // tokio's timeout rather than a wall-clock deadline inside the loop: the
+        // loop then has one exit for success and one for the bound, and a test can
+        // drive the bound with paused time instead of waiting for it.
+        tokio::time::timeout(VISIBILITY_TIMEOUT, poll)
+            .await
+            .unwrap_or_else(|_| {
+                Err(tonic::Status::deadline_exceeded(
+                    "the record store did not make this write readable in time",
+                ))
+            })
     }
 
-    /// The sweep's timer. Runs until the ServiceManager aborts it at shutdown.
+    /// Every row the store holds for one recipient, up to the page cap.
     ///
-    /// A TIMER IN THE SERVICE PROCESS, not a cluster cron, and that is a
-    /// deliberate choice rather than an oversight: this fleet has no scheduler
-    /// primitive, and the sweep does not need one, because every action it takes
-    /// is idempotent and derived from the row it reads. Two instances sweeping
-    /// the same row concurrently write the same value; a missed pass is caught
-    /// by the next one. The FencedLock (Phase 0 item 1) exists for work where
-    /// that is not true, and using it here would be buying exclusion this
-    /// operation does not need.
-    ///
-    /// The interval is re-read every pass, so a kernel config change takes
-    /// effect on the next tick with no redeploy and no restart.
-    pub async fn sweep_loop(self: Arc<Self>) {
-        loop {
-            tokio::time::sleep(self.sweep_interval()).await;
-            match self.sweep_once().await {
-                Ok(o) if o.expired > 0 => {
-                    tracing::info!(
-                        scanned = o.scanned,
-                        expired = o.expired,
-                        "mailbox state sweep"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    // A failed pass is not fatal: the next one re-derives
-                    // everything from state.
-                    tracing::error!(error = %e, "mailbox state sweep failed");
-                }
+    /// The tenant is NOT part of the predicate: `namespace` on this record is
+    /// deliberately not a `(spec.query_field)` (it exists to BE the egress
+    /// boundary), and the record plane's S2S half leaves a `/system` peer's read
+    /// unpinned — fleet-wide — so the caller's verified tenant is compared here,
+    /// on rows, by the callers of this method.
+    async fn rows_for_recipient(&self, recipient: &str) -> Result<Vec<MailboxEntry>, tonic::Status> {
+        let mut rows = Vec::new();
+        let mut page_token = String::new();
+        for _ in 0..MAX_SCAN_PAGES {
+            let filter = MailboxEntryFilter {
+                recipient: Some(recipient.to_string()),
+                ..Default::default()
+            };
+            let (items, next) = self
+                .rows
+                .list(filter, SCAN_PAGE_SIZE, page_token)
+                .await?;
+            rows.extend(items);
+            if next.is_empty() {
+                return Ok(rows);
             }
+            page_token = next;
         }
+        tracing::warn!(
+            pages = MAX_SCAN_PAGES,
+            "mailbox scan hit its page cap; a recipient's oldest rows were not examined"
+        );
+        Ok(rows)
     }
 }
 
@@ -282,9 +317,10 @@ fn now_ms() -> i64 {
 /// The BROKER's, not this process's, and the difference is replay. EventBus
 /// honours `start_from: earliest` with a real `seekToBeginning` on every
 /// assignment, so a reconnect re-delivers the whole topic; taking the wall clock
-/// would make `held_since_ms` — the clock retention and state expiry both
-/// measure from — jump forward every time a subscription reconnected. The broker
-/// timestamp is a property of the delivery, so it is stable across replays.
+/// would make `held_since_ms` — which is what "how long has this been sitting in
+/// my mailbox" is answered from — jump forward every time a subscription
+/// reconnected. The broker timestamp is a property of the delivery, so it is
+/// stable across replays.
 fn arrival_ms(meta: &RecordMeta) -> i64 {
     meta.timestamp
         .as_ref()
@@ -298,10 +334,20 @@ impl MailboxService {
     ///
     /// IDEMPOTENT BY CONSTRUCTION, because it has to be: `earliest` means the
     /// whole topic is re-delivered on every reconnect, so this runs again for
-    /// every message this mailbox has ever seen. An entry that already exists is
+    /// every message this mailbox has ever seen. A row that already exists is
     /// left exactly as it is — which is also what stops a replay from writing a
-    /// RETRIEVED row back to HELD, the one way this path could destroy state a
-    /// caller depends on.
+    /// RETRIEVED row back to HELD.
+    ///
+    /// THE ONE WINDOW WHERE THAT IS NOT AIRTIGHT, stated rather than hidden: the
+    /// existence check is a point read of the store, and a retrieval's own write
+    /// is visible only after stratum's ingest. `UpdateHeldMail` does not return
+    /// until that has happened, so a client that has been told "retrieved" is
+    /// safe; but a replay landing inside that sub-second window, between the
+    /// retrieval's publish and its visibility, would find no row and re-hold the
+    /// delivery. The user-visible consequence is seeing one piece of mail twice,
+    /// and acking it again is a no-op. Closing it properly needs the record
+    /// plane's synchronous publish-and-read, which the 2026-09-27 decision holds
+    /// in reserve rather than builds preemptively.
     pub async fn on_message(
         &self,
         msg: Message,
@@ -318,8 +364,7 @@ impl MailboxService {
             return Ok(());
         }
 
-        let existing = self.state.fetch_all_entries().await?;
-        if existing.contains_key(&msg.delivery_id) {
+        if self.rows.get(&msg.delivery_id).await?.is_some() {
             return Ok(());
         }
 
@@ -350,7 +395,11 @@ impl MailboxService {
             ..Default::default()
         };
 
-        self.write(&entry).await?;
+        // NOT `publish_and_confirm`: nothing reads this row back in the same
+        // breath, and an ingest round trip per delivery would be paid on every
+        // message of every replay. The cost is the replay window documented
+        // above, not a lost row — the publisher retries until the broker takes it.
+        self.publish_row(&entry)?;
         self.held.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(delivery_id = %entry.delivery_id, "mail held");
         Ok(())
@@ -376,16 +425,17 @@ impl MailboxHandler for MailboxService {
         // predicate here that were wider than the caller's own row set would not
         // leak; it would crash. That is the backstop working, not a fallback to
         // rely on.
-        let entries = self.state.fetch_all_entries().await?;
-        let mut held: Vec<MailboxEntry> = entries
-            .into_values()
+        let mut held: Vec<MailboxEntry> = self
+            .rows_for_recipient(&req.recipient)
+            .await?
+            .into_iter()
             .filter(|e| e.status == MailboxEntryStatus::Held as i32)
             .filter(|e| e.recipient == req.recipient)
             .filter(|e| e.namespace == req.namespace)
             .collect();
 
         // The order the RPC declares in (spec.method_collection).order_by. A
-        // paginated read whose order is whatever the map iterated in is not
+        // paginated read whose order is whatever the store returned is not
         // paginated.
         held.sort_by(|a, b| a.delivery_id.cmp(&b.delivery_id));
         held.truncate(MAX_HELD_PAGE);
@@ -405,14 +455,14 @@ impl MailboxHandler for MailboxService {
         // sent_at_ms for a whole submission: these ids were acknowledged by one
         // act and must not disagree about when.
         let now = now_ms();
-        let entries = self.state.fetch_all_entries().await?;
 
         let mut retrieved_delivery_ids = Vec::new();
         for delivery_id in &req.delivery_ids {
-            let Some(entry) = entries.get(delivery_id) else {
-                // An id naming no entry is absent from the response, not an
-                // error. A client cannot tell "already swept away" from "never
-                // existed" and should not have to.
+            // A point read per id rather than one scan: the ids are the page
+            // ListHeldMail just handed out (bounded at 100), and a keyed read is
+            // what the plane is good at.
+            let Some(entry) = self.rows.get(delivery_id).await? else {
+                // An id naming no row is absent from the response, not an error.
                 continue;
             };
             // Not the caller's row: skipped exactly as an unknown id is. The
@@ -433,7 +483,14 @@ impl MailboxHandler for MailboxService {
             let mut updated = entry.clone();
             updated.status = MailboxEntryStatus::Retrieved as i32;
             updated.retrieved_at_ms = now;
-            self.write(&updated).await?;
+            // WAIT for it. This is the read-your-own-write the store does not
+            // give for free, and the reason it is here and not on the consume
+            // path: the very next thing a client does is re-list, and a row that
+            // is still HELD in the store would hand it the same mail again.
+            self.publish_and_confirm(&updated, |row| {
+                row.status == MailboxEntryStatus::Retrieved as i32
+            })
+            .await?;
             self.retrieved.fetch_add(1, Ordering::Relaxed);
             retrieved_delivery_ids.push(delivery_id.clone());
         }
@@ -485,7 +542,7 @@ impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
         self.svc.set_config(cfg);
         tracing::info!(
             sweep_interval_seconds = cfg.sweep_interval_seconds,
-            "mailbox config applied"
+            "mailbox config applied (both fields are inert; see mailbox.proto)"
         );
         Ok(())
     }
@@ -506,7 +563,7 @@ impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
     }
 
     async fn shutdown(&self) {
-        let (held, retrieved, expired) = self.svc.counts();
-        tracing::info!(held, retrieved, expired, "mailbox shutting down");
+        let (held, retrieved) = self.svc.counts();
+        tracing::info!(held, retrieved, "mailbox shutting down");
     }
 }

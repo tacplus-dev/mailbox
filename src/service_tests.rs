@@ -1,7 +1,7 @@
-//! Round-trip, paired-control and state-sweep tests for the Mailbox service.
+//! Round-trip, paired-control and read-after-write tests for the Mailbox service.
 //!
-//! WHAT THESE DRIVE. Three seams, and the tests go through the real one in each
-//! case rather than around it:
+//! WHAT THESE DRIVE. Three seams, and the tests go through the real one where a
+//! real one can be reached:
 //!
 //!   - The two RPCs go in through the GENERATED `ValidationWrapper`, with a
 //!     signed bearer on the request metadata, exactly as a real client's call
@@ -10,43 +10,45 @@
 //!     rendered into that wrapper and NOWHERE else, so a test that called the
 //!     handler trait directly would quietly be asserting that this service
 //!     re-implements them — which it deliberately does not.
-//!   - The state reads and writes go through the GENERATED `MailboxStateClient`,
-//!     which talks gRPC to whatever hosts `MailboxStateService` — kernel in
-//!     production. The fixture here is an in-process server implementing that
-//!     generated trait over one `HashMap`, and the service under test cannot
-//!     tell the difference. This is scotty's fixture shape, for the same reason.
+//!   - The store is a FAKE STRATUM behind the `MailboxEntryRows` seam, fed by the
+//!     publisher: publishing a row "ingests" it, after a configurable lag, and
+//!     only then does a read see it. That is the record pipeline's actual shape —
+//!     a publish, an asynchronous ingest, a read — so the read-after-write the
+//!     handler performs is exercised rather than assumed.
 //!   - The consumer-group path goes in through `on_message` with a `RecordMeta`,
 //!     which is what the generated subscriber hands the handler.
 //!
-//! WHAT THESE DO NOT PROVE. The publisher is a capturing closure standing in for
-//! the generated EventBus publisher: it shows the real handler's real output —
-//! the actual `MailboxEntry` values and the actual count — but it cannot show
-//! that a broker accepted them. Nothing here can say anything about the record
-//! store's residency clock either: `(spec.record).residency` is a declaration
+//! WHY THE STORE IS A FAKE AND NOT THE GENERATED READER, since the previous shape
+//! of this file DID stand up the generated `MailboxStateClient` over an
+//! in-process server: the record plane's server trait (`query::RecordMap`) is 112
+//! methods and 28 stream types, because it covers every `(spec.record)` in the
+//! fleet. A fixture implementing it is not a fixture. So `RecordPlaneRows` — the
+//! four lines that forward to the generated `MailboxEntryRecordReader` — is the
+//! one part of the read path these tests do not cover, exactly as letsencrypt's
+//! `recordStore` is the part its `certRecordStore` fake does not cover.
+//!
+//! WHAT THESE DO NOT PROVE. That a broker accepted a publish, or anything about
+//! the record store's residency clock: `(spec.record).residency` is a declaration
 //! the store acts on, with no runtime surface in this service to drive or
-//! observe. The per-row `ejectionable` gate these tests used to exercise was
-//! retired on 2026-09-20 (tacplus cd8829fb) and its tests went with it.
+//! observe. There are no sweep tests any more either — the state root the sweep
+//! pruned went away on 2026-09-27 and nothing replaced it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::mailbox::{
     Authorizer, ValidationWrapper,
 };
-use mailbox_model::s2sm::internal::state::services::mailbox_state::state::MailboxStateClient;
 use mailbox_model::types::generated::eventbus_support::eventbus_support::RecordMeta;
 use mailbox_model::types::services::mailbox::mailbox_server::Mailbox;
-use mailbox_model::types::services::mailbox::mailbox_state_service_server::{
-    MailboxStateService, MailboxStateServiceServer,
-};
 use mailbox_model::types::services::mailbox::*;
 use mailbox_model::types::services::messaging::Message;
 use mailbox_model::types::sys::accounting::accounting::Event;
-use tonic::codegen::tokio_stream;
-use tonic::transport::Channel;
+use mailbox_model::types::vservices::query::MailboxEntryFilter;
+use tokio::time::Instant;
 
-use crate::service::MailboxService;
+use crate::service::{MailboxEntryRows, MailboxService};
 
 /// The tenant every fixture token carries. Nothing asserts on the literal except
 /// the namespace tests, which need a SECOND value to disagree with it.
@@ -57,146 +59,107 @@ const ALICE: &str = "user:alice";
 const BOB: &str = "user:bob";
 
 // ---------------------------------------------------------------------------
-// The fake kernel
+// The fake stratum
 // ---------------------------------------------------------------------------
 
-/// One collection, so this is written out rather than macro-generated the way
-/// scotty's six collections are. `get_all_entries`, `put_entries` and
-/// `delete_entries` are the only methods on any path this service takes; the
-/// rest exist so the generated trait is satisfied and fail loudly rather than
-/// returning a plausible empty value, so a test that starts depending on one
-/// finds out instead of quietly reading nothing.
+/// One record's rows, with the ingest lag that makes this a record store rather
+/// than a map.
 ///
-/// `watch_entries` returns a stream that never yields, which is what a healthy
-/// idle Watch looks like — the client's reconnect loop stays parked rather than
-/// spinning. It is also why this service reads with `fetch_all_entries` and
-/// never with the locally cached `get_entries_map`: against this fixture the
-/// cache would be permanently empty, and in production it would be merely
-/// stale, which for "have I already handed out this mail" is the same bug.
+/// `ingest` is what the harness's publisher calls — publishing IS writing, so the
+/// fake's only writer is the topic. A row becomes readable `lag` after it is
+/// published, which is the window `MailboxService::publish_and_confirm` exists to
+/// close. `lag` defaults to zero so every test that is not about visibility reads
+/// what it just wrote.
 #[derive(Default)]
-struct FakeKernel {
-    entries: Mutex<HashMap<String, MailboxEntry>>,
+struct FakeStratum {
+    /// delivery_id -> (row, the moment it becomes readable).
+    rows: Mutex<HashMap<String, (MailboxEntry, Option<Instant>)>>,
+    lag: Mutex<Duration>,
 }
 
-#[tonic::async_trait]
-impl MailboxStateService for FakeKernel {
-    async fn get_entries(
-        &self,
-        request: tonic::Request<EntriesGetRequest>,
-    ) -> Result<tonic::Response<EntriesValueResponse>, tonic::Status> {
-        let value = self
-            .entries
+impl FakeStratum {
+    fn set_lag(&self, lag: Duration) {
+        *self.lag.lock().unwrap() = lag;
+    }
+
+    /// stratum's side of a publish.
+    fn ingest(&self, entry: MailboxEntry) {
+        let lag = *self.lag.lock().unwrap();
+        let visible_at = if lag.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + lag)
+        };
+        self.rows
             .lock()
             .unwrap()
-            .get(&request.into_inner().key)
-            .cloned();
-        Ok(tonic::Response::new(EntriesValueResponse {
-            found: value.is_some(),
-            value,
-            ..Default::default()
-        }))
+            .insert(entry.delivery_id.clone(), (entry, visible_at));
     }
 
-    async fn put_entries(
-        &self,
-        request: tonic::Request<EntriesPutRequest>,
-    ) -> Result<tonic::Response<EntriesValueResponse>, tonic::Status> {
-        let req = request.into_inner();
-        let value = req
-            .value
-            .ok_or_else(|| tonic::Status::invalid_argument("put with no value"))?;
-        self.entries.lock().unwrap().insert(req.key, value.clone());
-        Ok(tonic::Response::new(EntriesValueResponse {
-            found: true,
-            value: Some(value),
-            ..Default::default()
-        }))
-    }
-
-    async fn get_all_entries(
-        &self,
-        _request: tonic::Request<EntriesGetAllRequest>,
-    ) -> Result<tonic::Response<EntriesEntriesResponse>, tonic::Status> {
-        Ok(tonic::Response::new(EntriesEntriesResponse {
-            entries: self.entries.lock().unwrap().clone(),
-            ..Default::default()
-        }))
-    }
-
-    async fn delete_entries(
-        &self,
-        request: tonic::Request<EntriesGetRequest>,
-    ) -> Result<tonic::Response<MapEmpty>, tonic::Status> {
-        self.entries
+    /// Every readable row, in key order — the order a store with an indexed key
+    /// would page in, so `list` below can page deterministically.
+    fn visible(&self) -> Vec<MailboxEntry> {
+        let now = Instant::now();
+        let mut rows: Vec<MailboxEntry> = self
+            .rows
             .lock()
             .unwrap()
-            .remove(&request.into_inner().key);
-        Ok(tonic::Response::new(MapEmpty::default()))
+            .values()
+            .filter(|(_, visible_at)| visible_at.map_or(true, |t| now >= t))
+            .map(|(row, _)| row.clone())
+            .collect();
+        rows.sort_by(|a, b| a.delivery_id.cmp(&b.delivery_id));
+        rows
     }
 
-    async fn set_entries(
-        &self,
-        _request: tonic::Request<EntriesPutRequest>,
-    ) -> Result<tonic::Response<MapEmpty>, tonic::Status> {
-        Err(tonic::Status::unimplemented("set_entries"))
+    /// One row whether or not it is readable yet — for assertions about what was
+    /// WRITTEN, which is not the same question as what a caller can see.
+    fn stored(&self, delivery_id: &str) -> Option<MailboxEntry> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(delivery_id)
+            .map(|(row, _)| row.clone())
     }
-    async fn remove_entries(
-        &self,
-        _request: tonic::Request<EntriesGetRequest>,
-    ) -> Result<tonic::Response<EntriesValueResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("remove_entries"))
-    }
-    async fn contains_key_entries(
-        &self,
-        _request: tonic::Request<EntriesGetRequest>,
-    ) -> Result<tonic::Response<EntriesValueResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("contains_key_entries"))
-    }
-    async fn key_set_entries(
-        &self,
-        _request: tonic::Request<EntriesKeysRequest>,
-    ) -> Result<tonic::Response<EntriesKeysResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("key_set_entries"))
-    }
-    async fn size_entries(
-        &self,
-        _request: tonic::Request<EntriesSizeRequest>,
-    ) -> Result<tonic::Response<EntriesSizeResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("size_entries"))
-    }
-    async fn clear_entries(
-        &self,
-        _request: tonic::Request<EntriesClearRequest>,
-    ) -> Result<tonic::Response<MapEmpty>, tonic::Status> {
-        Err(tonic::Status::unimplemented("clear_entries"))
-    }
-    async fn put_if_absent_entries(
-        &self,
-        _request: tonic::Request<EntriesPutRequest>,
-    ) -> Result<tonic::Response<EntriesValueResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("put_if_absent_entries"))
-    }
-    async fn query_entries(
-        &self,
-        _request: tonic::Request<EntriesQueryRequest>,
-    ) -> Result<tonic::Response<EntriesQueryResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("query_entries"))
+}
+
+#[async_trait::async_trait]
+impl MailboxEntryRows for FakeStratum {
+    async fn get(&self, delivery_id: &str) -> Result<Option<MailboxEntry>, tonic::Status> {
+        Ok(self
+            .visible()
+            .into_iter()
+            .find(|r| r.delivery_id == delivery_id))
     }
 
-    type WatchEntriesStream = tokio_stream::Pending<Result<EntriesEntriesResponse, tonic::Status>>;
-    async fn watch_entries(
+    /// The criteria this fake honours are the ones `MailboxEntryFilter` carries
+    /// and the service actually sets: `recipient`. Anything else the service
+    /// started sending would silently not narrow here, which is why the
+    /// namespace tests below assert on rows and not on the predicate.
+    async fn list(
         &self,
-        _request: tonic::Request<mailbox_model::types::sys::trace::trace::TraceRequest>,
-    ) -> Result<tonic::Response<Self::WatchEntriesStream>, tonic::Status> {
-        Ok(tonic::Response::new(tokio_stream::pending()))
-    }
-
-    type WatchQueryEntriesStream = tokio_stream::Pending<Result<EntriesQueryResponse, tonic::Status>>;
-    async fn watch_query_entries(
-        &self,
-        _request: tonic::Request<EntriesQueryRequest>,
-    ) -> Result<tonic::Response<Self::WatchQueryEntriesStream>, tonic::Status> {
-        Ok(tonic::Response::new(tokio_stream::pending()))
+        filter: MailboxEntryFilter,
+        page_size: i32,
+        page_token: String,
+    ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
+        let matching: Vec<MailboxEntry> = self
+            .visible()
+            .into_iter()
+            .filter(|r| {
+                filter
+                    .recipient
+                    .as_ref()
+                    .map_or(true, |want| &r.recipient == want)
+            })
+            .filter(|r| r.delivery_id.as_str() > page_token.as_str())
+            .collect();
+        let page: Vec<MailboxEntry> = matching.iter().take(page_size as usize).cloned().collect();
+        let next = if matching.len() > page.len() {
+            page.last().map(|r| r.delivery_id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok((page, next))
     }
 }
 
@@ -278,56 +241,33 @@ impl am::Sink for CapturingSink {
 // ---------------------------------------------------------------------------
 
 struct Harness {
-    /// The service, reachable directly for the consumer-group and sweep tests
-    /// (neither of which is an RPC) and through the wrapper for the RPCs.
+    /// The service, reachable directly for the consumer-group path (which is not
+    /// an RPC) and through the wrapper for the RPCs.
     svc: Arc<MailboxService>,
     wrapper: ValidationWrapper,
-    /// Every `MailboxEntry` the service published, in order. The record-side
-    /// evidence: what the store would have been sent.
+    /// Every `MailboxEntry` the service published, in order — the record-side
+    /// evidence of what was written, and in what sequence.
     published: Arc<Mutex<Vec<MailboxEntry>>>,
-    /// The store itself, so a test can read the rows the service WROTE — the
-    /// only way to assert on a field no response carries.
-    kernel: Arc<FakeKernel>,
+    /// The store the publisher feeds, so a test can read the rows the service
+    /// wrote — the only way to assert on a field no response carries.
+    stratum: Arc<FakeStratum>,
 }
 
 impl Harness {
     async fn start() -> Harness {
-        // A port is claimed, released and immediately re-bound by tonic. The
-        // connect loop below covers the gap rather than assuming it away.
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let kernel = Arc::new(FakeKernel::default());
-        let served = kernel.clone();
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(MailboxStateServiceServer::from_arc(served))
-                .serve(addr)
-                .await
-                .unwrap();
-        });
-
-        let uri = format!("http://{addr}");
-        let mut channel: Option<Channel> = None;
-        for _ in 0..100 {
-            match Channel::from_shared(uri.clone()).unwrap().connect().await {
-                Ok(c) => {
-                    channel = Some(c);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-            }
-        }
-        let channel = channel.expect("fake kernel never came up");
-
-        let state = MailboxStateClient::new(channel, None).await.unwrap();
+        let stratum = Arc::new(FakeStratum::default());
         let published: Arc<Mutex<Vec<MailboxEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // The publisher IS the write path, so the fixture's publisher is what
+        // feeds the store — a test cannot write a row the service did not
+        // publish, which is the property the old two-store fixture could not have.
         let sink = published.clone();
+        let ingest = stratum.clone();
         let svc = Arc::new(MailboxService::new(
-            state,
+            stratum.clone(),
             Arc::new(move |e: MailboxEntry| {
-                sink.lock().unwrap().push(e);
+                sink.lock().unwrap().push(e.clone());
+                ingest.ingest(e);
                 Ok(())
             }),
         ));
@@ -352,7 +292,7 @@ impl Harness {
             svc,
             wrapper,
             published,
-            kernel,
+            stratum,
         }
     }
 
@@ -396,11 +336,11 @@ impl Harness {
     }
 
     fn row(&self, delivery_id: &str) -> Option<MailboxEntry> {
-        self.kernel.entries.lock().unwrap().get(delivery_id).cloned()
+        self.stratum.stored(delivery_id)
     }
 
-    fn rows(&self) -> HashMap<String, MailboxEntry> {
-        self.kernel.entries.lock().unwrap().clone()
+    fn rows(&self) -> Vec<MailboxEntry> {
+        self.stratum.visible()
     }
 
     /// Deliver one message on the consumer group, as the generated subscriber
@@ -1045,86 +985,167 @@ async fn a_row_from_another_tenant_is_not_retrievable() {
 }
 
 // ---------------------------------------------------------------------------
-// The state-root sweep
+// Read-after-write — what replaced the state root
 // ---------------------------------------------------------------------------
 
-/// The sweep leaves an unexpired row alone whatever its status: it has one
-/// predicate, `held_since_ms`, and the row below is 89 days old and unretrieved.
+/// A retrieval does not answer until the store will hand the row back.
 ///
-/// Since 2026-09-20 this is the whole of the sweep's behaviour on a live row.
-/// Memory residency is the record store's, on a type-level clock declared in
-/// `(spec.record).residency`, and there is no per-row gate here to set.
-#[tokio::test]
-async fn the_sweep_leaves_an_unexpired_row_untouched() {
+/// THE POINT OF THE WHOLE MIGRATION, and the one thing kernel state used to give
+/// for free. The store here takes 200ms to ingest; the handler must not return
+/// before then, because the client's very next `ListHeldMail` would otherwise
+/// still see the row as HELD and hand it the same mail again.
+#[tokio::test(start_paused = true)]
+async fn a_retrieval_waits_for_the_store_to_make_it_visible() {
     let h = Harness::start().await;
-    let eighty_nine_days_ago = now_ms() - 89 * 24 * 60 * 60 * 1000;
-    h.deliver(delivery("m1", ALICE, TENANT), eighty_nine_days_ago)
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
         .await;
-    let published_before = h.published().len();
+    h.stratum.set_lag(Duration::from_millis(200));
+    let id = format!("m1/{ALICE}");
 
-    let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.expired, 0);
-    assert_eq!(outcome.scanned, 1);
+    let started = Instant::now();
+    h.wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("retrieve");
 
-    let row = h.row(&format!("m1/{ALICE}")).unwrap();
-    assert_eq!(row.status, MailboxEntryStatus::Held as i32);
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the rpc returned before its own write was readable"
+    );
+
+    // And the read that follows it is correct, which is what the wait buys.
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+    assert!(resp.entries.is_empty());
+}
+
+/// A store that never makes the write readable is a FAILED SAVE, not a success.
+///
+/// Reported rather than swallowed: the publish will still land, but a client told
+/// "retrieved" and then handed the same mail again is the outcome the wait exists
+/// to prevent, so exceeding the bound has to be visible to the caller.
+#[tokio::test(start_paused = true)]
+async fn a_retrieval_that_never_becomes_visible_fails() {
+    let h = Harness::start().await;
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    // Far beyond VISIBILITY_TIMEOUT. Paused time makes this instant.
+    h.stratum.set_lag(Duration::from_secs(600));
+
+    let err = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![format!("m1/{ALICE}")],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect_err("an unreadable write must not be reported as saved");
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+
+    // The row WAS published — the publish is not undone by the wait failing, and
+    // saying otherwise would be a lie about what the service did.
     assert_eq!(
-        h.published().len(),
-        published_before,
-        "the sweep writes nothing to a row it does not expire"
+        h.row(&format!("m1/{ALICE}")).unwrap().status,
+        MailboxEntryStatus::Retrieved as i32
     );
 }
 
-/// THE ONE PLACE THIS SERVICE DELETES ANYTHING: a row that reached
-/// `STATE_RETENTION_MS` leaves kernel state, so `MailboxState.entries` cannot
-/// grow past the bound it declares. Measured from `held_since_ms`, and it is now
-/// the only expiry in this record's life — `(spec.record).retention` was retired
-/// on 2026-09-20 and the record store deletes nothing.
-#[tokio::test]
-async fn the_sweep_expires_rows_at_the_state_retention_age() {
+/// The consume path does NOT wait. A delivery per ingest round trip would put
+/// that latency in front of every message of every replay, and nothing reads
+/// these rows back in the same breath.
+#[tokio::test(start_paused = true)]
+async fn the_consume_path_does_not_wait_for_ingest() {
     let h = Harness::start().await;
-    let ninety_one_days_ago = now_ms() - 91 * 24 * 60 * 60 * 1000;
-    h.deliver(delivery("m1", ALICE, TENANT), ninety_one_days_ago)
-        .await;
-    h.deliver(delivery("m2", ALICE, TENANT), now_ms()).await;
+    h.stratum.set_lag(Duration::from_secs(600));
 
-    let outcome = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(outcome.expired, 1);
-    assert!(h.row(&format!("m1/{ALICE}")).is_none());
-    assert!(h.row(&format!("m2/{ALICE}")).is_some());
+    let started = Instant::now();
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert_eq!(h.published().len(), 1);
 }
 
-/// The sweep is idempotent: a second pass over the same state changes nothing.
-/// That is what makes running it on a plain timer, on every instance, without a
-/// lock, correct.
-#[tokio::test]
-async fn the_sweep_is_idempotent() {
-    let h = Harness::start().await;
-    let ninety_one_days_ago = now_ms() - 91 * 24 * 60 * 60 * 1000;
-    h.deliver(delivery("m1", ALICE, TENANT), ninety_one_days_ago)
-        .await;
-    h.deliver(delivery("m2", ALICE, TENANT), now_ms()).await;
+// ---------------------------------------------------------------------------
+// Paging — the scan that replaced a whole-collection fetch
+// ---------------------------------------------------------------------------
 
-    let first = h.svc.sweep_once().await.expect("sweep");
-    let second = h.svc.sweep_once().await.expect("sweep");
-    assert_eq!(first.expired, 1);
-    assert_eq!(second.expired, 0);
-    assert_eq!(second.scanned, 1, "the expired row is gone, not re-examined");
+/// `ListHeldMail` pages the store until it has the rows it needs.
+///
+/// HELD-ness is not a `(spec.query_field)` and deliberately is not one, so the
+/// status filter runs over pages rather than in the predicate: a recipient whose
+/// mailbox is larger than one page must still get their held mail.
+#[tokio::test]
+async fn list_held_mail_pages_the_store() {
+    let h = Harness::start().await;
+    // More rows than one page of the scan, in an order that is not key order.
+    for i in (0..450).rev() {
+        h.deliver(
+            delivery(&format!("m{i:04}"), ALICE, TENANT),
+            1_700_000_100_000,
+        )
+        .await;
+    }
+
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+
+    // The declared page of 100, in key order, from the front of the mailbox.
+    assert_eq!(resp.entries.len(), 100);
+    assert_eq!(resp.entries[0].delivery_id, format!("m0000/{ALICE}"));
+    assert_eq!(resp.entries[99].delivery_id, format!("m0099/{ALICE}"));
 }
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-/// The sweep cadence is kernel config, re-read every pass, so a change takes
-/// effect with no redeploy and no restart.
+/// Config is applied, and both of its fields are INERT.
+///
+/// `sweep_interval_seconds` paced a state-root sweep that no longer exists and
+/// `retrieved_grace_seconds` deferred an eviction mark retired on 2026-09-20.
+/// Neither is deleted from the proto because kernel sets them; this asserts that
+/// delivery still works and that nothing in this service acts on either value.
 #[tokio::test]
-async fn the_sweep_interval_comes_from_kernel_config() {
+async fn config_is_applied_and_both_fields_are_inert() {
     let h = Harness::start().await;
-    assert_eq!(h.svc.sweep_interval(), std::time::Duration::from_secs(300));
+    assert_eq!(h.svc.sweep_interval_seconds(), 300);
+
     h.svc.set_config(&mailbox::Config {
         sweep_interval_seconds: 30,
+        retrieved_grace_seconds: 60,
         ..Default::default()
     });
-    assert_eq!(h.svc.sweep_interval(), std::time::Duration::from_secs(30));
+    assert_eq!(h.svc.sweep_interval_seconds(), 30);
+
+    // Nothing observable changed: no timer to retime, and no row touched.
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    assert_eq!(h.published().len(), 1);
 }

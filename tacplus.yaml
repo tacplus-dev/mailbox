@@ -1,4 +1,4 @@
 language: rust
-pkg: com.gitlab.secondstarcavalier.controlplane.schematic.services.mailbox
+pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox
 output-dir: target/generated-sources
-src: https://gitlab.com/secondstarcavalier/schematic/platform/proto.git
+src: https://gitlab.com/seabeam/schematic/platform/proto.git

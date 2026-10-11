@@ -12,6 +12,15 @@ tonic = { version = "0.14", features = ["transport"] }
 tracing = "0.1"
 async-trait = "0.1"
 
+# Gmail (src/gmail.rs). reqwest as oauth names it: rustls with the Mozilla roots
+# compiled in, because the runtime image ships no /etc/ssl/certs. rsa signs the
+# RS256 JWT-bearer assertion, which the chassis key cannot (it has no RS256).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-webpki-roots", "json"] }
+rsa = { version = "0.9", features = ["sha2"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Tests only, and the same three crates messaging's tests use, for the same
 # reason: the tests drive the GENERATED ValidationWrapper rather than the handler
 # trait, because the (spec.principal)/(spec.namespace) stamps and the
@@ -35,3 +44,5 @@ prost-wkt-types = "0.7.1"
 token = { path = "target/generated-sources/model/chassis/token" }
 key = { path = "target/generated-sources/model/chassis/key" }
 am = { path = "target/generated-sources/model/chassis/am" }
+# Decodes the form the gmail tests' fake Google token endpoint receives.
+serde_urlencoded = "0.7"

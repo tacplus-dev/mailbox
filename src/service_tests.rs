@@ -1149,3 +1149,35 @@ async fn config_is_applied_and_both_fields_are_inert() {
         .await;
     assert_eq!(h.published().len(), 1);
 }
+
+/// Gmail on without its key is refused, and the refusal names the env var the
+/// operator's SecretEnvVars entry must set.
+#[tokio::test]
+async fn gmail_config_without_the_service_account_key_is_refused() {
+    let h = Harness::start().await;
+    let handler = crate::service::MailboxServiceHandler::new(h.svc.clone());
+    let gmail = mailbox::GmailConfig {
+        mailbox: "hello@seabeam.test".to_string(),
+        send_as: "tally@seabeam.test".to_string(),
+        send_as_name: "Tally for SeaBeam".to_string(),
+        watch_topic: "projects/p/topics/t".to_string(),
+        ..Default::default()
+    };
+
+    let err = handler.apply_gmail(Some(&gmail), "").unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("PROTO_SERVICES_MAILBOX_SECRETS_GMAIL_SERVICE_ACCOUNT_JSON"),
+        "{err}"
+    );
+}
+
+/// Without `gmail` the service touches no Google API, key or not.
+#[tokio::test]
+async fn no_gmail_config_needs_no_key() {
+    let h = Harness::start().await;
+    let handler = crate::service::MailboxServiceHandler::new(h.svc.clone());
+
+    handler.apply_gmail(None, "").unwrap();
+}

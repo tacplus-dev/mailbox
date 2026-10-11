@@ -1,3 +1,6 @@
+mod gmail;
+#[cfg(test)]
+mod gmail_tests;
 mod service;
 #[cfg(test)]
 mod service_tests;

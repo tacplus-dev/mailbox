@@ -47,7 +47,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::mailbox::MailboxHandler;
 use mailbox_model::types::generated::eventbus_support::eventbus_support::RecordMeta;
-use mailbox_model::types::services::mailbox::mailbox::Config as MailboxConfig;
+use mailbox_model::types::services::mailbox::helpers::secrets_from_env_var;
+use mailbox_model::types::services::mailbox::mailbox::{Config as MailboxConfig, GmailConfig};
 use mailbox_model::types::services::mailbox::{
     ListHeldMailRequest, ListHeldMailResponse, MailboxEntry, MailboxEntryStatus,
     UpdateHeldMailRequest, UpdateHeldMailResponse,
@@ -522,11 +523,42 @@ const MAX_HELD_PAGE: usize = 100;
 /// The generated `Handler` the ServiceManager registers, wrapping the service.
 pub struct MailboxServiceHandler {
     svc: Arc<MailboxService>,
+    /// The task keeping the Gmail watch alive (`gmail::keep_watch`), when
+    /// `Config.gmail` is set. Replaced on every config delivery.
+    gmail_watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MailboxServiceHandler {
     pub fn new(svc: Arc<MailboxService>) -> Self {
-        Self { svc }
+        Self {
+            svc,
+            gmail_watch: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Stop any running watch and, when `gmail` is set, start one for it.
+    ///
+    /// `service_account_json` is `Secrets.gmail_service_account_json`; config
+    /// that turns Gmail on without it is refused, naming the variable.
+    pub fn apply_gmail(
+        &self,
+        gmail: Option<&GmailConfig>,
+        service_account_json: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut running = self.gmail_watch.lock().map_err(|e| e.to_string())?;
+        if let Some(task) = running.take() {
+            task.abort();
+        }
+        let Some(gmail) = gmail else {
+            return Ok(());
+        };
+        if service_account_json.is_empty() {
+            return Err("Config.gmail is set but PROTO_SERVICES_MAILBOX_SECRETS_GMAIL_SERVICE_ACCOUNT_JSON is empty".into());
+        }
+        let adapter =
+            crate::gmail::GmailAdapter::new(gmail, service_account_json, crate::gmail::GMAIL_API)?;
+        *running = Some(tokio::spawn(crate::gmail::keep_watch(adapter)));
+        Ok(())
     }
 }
 
@@ -540,9 +572,14 @@ impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
         // Delivered before the server accepts traffic, and again on every
         // change.
         self.svc.set_config(cfg);
+        // Secret inputs come from the pod env (operator SecretEnvVars), never
+        // from Config, which every config-holder in the fleet can read.
+        let secrets = secrets_from_env_var(&std::env::vars().collect());
+        self.apply_gmail(cfg.gmail.as_ref(), &secrets.gmail_service_account_json)?;
         tracing::info!(
             sweep_interval_seconds = cfg.sweep_interval_seconds,
-            "mailbox config applied (both fields are inert; see mailbox.proto)"
+            gmail = cfg.gmail.is_some(),
+            "mailbox config applied (sweep fields are inert; see mailbox.proto)"
         );
         Ok(())
     }

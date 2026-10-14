@@ -1181,3 +1181,31 @@ async fn no_gmail_config_needs_no_key() {
 
     handler.apply_gmail(None, "").unwrap();
 }
+
+/// The outbound-email kill switch (ops/datagate/README.md): a config delivery
+/// without `gmail` stops the running Gmail task, and no Google endpoint is
+/// called again. The key's token endpoint is a local listener that drops every
+/// connection, so each watch attempt is one connection and then a retry after
+/// `WATCH_RETRY`; paused time runs those retries without waiting.
+#[tokio::test(start_paused = true)]
+async fn gmail_off_stops_every_google_call() {
+    let h = Harness::start().await;
+    let handler = crate::service::MailboxServiceHandler::new(h.svc.clone());
+    let google = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_uri = format!("http://{}/token", google.local_addr().unwrap());
+
+    handler
+        .apply_gmail(
+            Some(&crate::gmail_tests::gmail_config()),
+            &crate::gmail_tests::key_file(&token_uri),
+        )
+        .unwrap();
+    // The first attempt, and the retry: the task is live and keeps calling.
+    drop(google.accept().await.unwrap());
+    drop(google.accept().await.unwrap());
+
+    handler.apply_gmail(None, "").unwrap();
+
+    let later = tokio::time::timeout(Duration::from_secs(24 * 3600), google.accept()).await;
+    assert!(later.is_err(), "a Google call after gmail was switched off");
+}

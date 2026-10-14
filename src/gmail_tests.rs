@@ -58,7 +58,7 @@ const TOPIC: &str = "projects/test-project/topics/crew-mail-gmail-watch";
 const SCOPES: &str =
     "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
 
-fn gmail_config() -> GmailConfig {
+pub(crate) fn gmail_config() -> GmailConfig {
     GmailConfig {
         mailbox: MAILBOX.to_string(),
         send_as: SEND_AS.to_string(),
@@ -69,7 +69,7 @@ fn gmail_config() -> GmailConfig {
 }
 
 /// A service-account key file as Google issues it, pointing at `token_uri`.
-fn key_file(token_uri: &str) -> String {
+pub(crate) fn key_file(token_uri: &str) -> String {
     json!({
         "type": "service_account",
         "client_email": SA_EMAIL,

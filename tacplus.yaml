@@ -3,4 +3,4 @@ pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox
 output-dir: target/generated-sources
 src: https://gitlab.com/seabeam/schematic/platform/proto.git
 header: |
-  Copyright (c) 2026 SeaBeam LLC. All rights reserved.
+  Copyright (c) 2026 Seabeam LLC. All rights reserved.

@@ -46,9 +46,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::mailbox::MailboxHandler;
+use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::sign_in_mail::SignInMailHandler;
 use mailbox_model::types::generated::eventbus_support::eventbus_support::RecordMeta;
 use mailbox_model::types::services::mailbox::helpers::secrets_from_env_var;
-use mailbox_model::types::services::mailbox::mailbox::{Config as MailboxConfig, GmailConfig};
+use mailbox_model::types::services::mailbox::mailbox::{
+    Config as MailboxConfig, GmailConfig, SendSignInMailRequest, SendSignInMailResponse,
+};
 use mailbox_model::types::services::mailbox::{
     ListHeldMailRequest, ListHeldMailResponse, MailboxEntry, MailboxEntryStatus,
     UpdateHeldMailRequest, UpdateHeldMailResponse,
@@ -520,9 +523,68 @@ impl MailboxHandler for MailboxService {
 /// validation, which is an internal error, so the truncation is here.
 const MAX_HELD_PAGE: usize = 100;
 
+/// SignInMail: the oauth service's one mail, a sign-in link (mailbox.proto).
+///
+/// Subject, body and sender are fixed here; the caller names only the
+/// recipient and the link. Nothing is logged but the outcome: the link is a
+/// credential and the address is the person.
+#[derive(Default)]
+pub struct SignInMailService {
+    /// The adapter `apply_gmail` built from the current config; None while
+    /// `Config.gmail` is unset.
+    gmail: RwLock<Option<Arc<crate::gmail::GmailAdapter>>>,
+}
+
+impl SignInMailService {
+    pub fn set_gmail(&self, gmail: Option<Arc<crate::gmail::GmailAdapter>>) {
+        *self.gmail.write().unwrap_or_else(|e| e.into_inner()) = gmail;
+    }
+}
+
+/// The sign-in mail for `link`, which works for `expires_in_seconds`.
+pub fn sign_in_mail(to: &str, link: &str, expires_in_seconds: i64) -> crate::gmail::OutboundMail {
+    let minutes = (expires_in_seconds + 59) / 60;
+    crate::gmail::OutboundMail {
+        to: to.to_string(),
+        subject: "Your SeaBeam sign-in link".to_string(),
+        body: format!(
+            "Use this link to sign in to SeaBeam:\r\n\r\n{link}\r\n\r\n\
+             It works once, within {minutes} minutes. If you did not ask to sign in, \
+             ignore this mail: nothing happens without the link.\r\n"
+        ),
+        agent: None,
+    }
+}
+
+#[tonic::async_trait]
+impl SignInMailHandler for SignInMailService {
+    async fn send_sign_in_mail(
+        &self,
+        _caller: Option<&servicemanager::auth::Caller>,
+        req: SendSignInMailRequest,
+    ) -> Result<SendSignInMailResponse, tonic::Status> {
+        let gmail = self
+            .gmail
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| tonic::Status::failed_precondition("Config.gmail is unset: no mail path"))?;
+        let id = gmail
+            .send(&sign_in_mail(&req.to, &req.link, req.expires_in_seconds))
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "sign-in mail send failed");
+                tonic::Status::unavailable("sign-in mail could not be sent")
+            })?;
+        tracing::info!(gmail_message_id = %id, "sign-in mail sent");
+        Ok(SendSignInMailResponse::default())
+    }
+}
+
 /// The generated `Handler` the ServiceManager registers, wrapping the service.
 pub struct MailboxServiceHandler {
     svc: Arc<MailboxService>,
+    sign_in_mail: Arc<SignInMailService>,
     /// The task keeping the Gmail watch alive (`gmail::keep_watch`), when
     /// `Config.gmail` is set. Replaced on every config delivery.
     gmail_watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -532,6 +594,7 @@ impl MailboxServiceHandler {
     pub fn new(svc: Arc<MailboxService>) -> Self {
         Self {
             svc,
+            sign_in_mail: Arc::new(SignInMailService::default()),
             gmail_watch: std::sync::Mutex::new(None),
         }
     }
@@ -549,14 +612,19 @@ impl MailboxServiceHandler {
         if let Some(task) = running.take() {
             task.abort();
         }
+        self.sign_in_mail.set_gmail(None);
         let Some(gmail) = gmail else {
             return Ok(());
         };
         if service_account_json.is_empty() {
             return Err("Config.gmail is set but PROTO_SERVICES_MAILBOX_SECRETS_GMAIL_SERVICE_ACCOUNT_JSON is empty".into());
         }
-        let adapter =
-            crate::gmail::GmailAdapter::new(gmail, service_account_json, crate::gmail::GMAIL_API)?;
+        let adapter = Arc::new(crate::gmail::GmailAdapter::new(
+            gmail,
+            service_account_json,
+            crate::gmail::GMAIL_API,
+        )?);
+        self.sign_in_mail.set_gmail(Some(adapter.clone()));
         *running = Some(tokio::spawn(crate::gmail::keep_watch(adapter)));
         Ok(())
     }
@@ -566,6 +634,17 @@ impl MailboxServiceHandler {
 impl mailbox_model::s2sm::handler::Handler for MailboxServiceHandler {
     fn mailbox_grpc_impl(&self) -> Arc<dyn MailboxHandler> {
         self.svc.clone()
+    }
+
+    fn sign_in_mail_grpc_impl(&self) -> Arc<dyn SignInMailHandler> {
+        self.sign_in_mail.clone()
+    }
+
+    /// The same Config `mailbox_config` is handed, which has already applied
+    /// its Gmail half for both services; applying it twice would restart the
+    /// watch twice.
+    async fn sign_in_mail_config(&self, _cfg: &MailboxConfig) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
 
     async fn mailbox_config(&self, cfg: &MailboxConfig) -> Result<(), Box<dyn std::error::Error>> {

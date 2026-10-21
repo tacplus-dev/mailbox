@@ -18,7 +18,6 @@
 //! LOGGING. Nothing here logs an address, a subject or a body, for the reason
 //! main.rs gives: only ids, history ids and counts.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -109,19 +108,13 @@ struct MessageRef {
     id: String,
 }
 
-/// The From display name of mail the platform itself sends (`agent` None).
-const SYSTEM_SENDER_NAME: &str = "SeaBeam";
-
-/// One plain-text mail.
+/// One plain-text mail from the configured send-as address.
 pub struct OutboundMail {
     pub to: String,
     pub subject: String,
     pub body: String,
-    /// The crew member sending, for the `X-SeaBeam-Agent` header (e.g. "tally"),
-    /// From the configured send-as alias. None is the platform's own mail (a
-    /// sign-in link): From the Workspace mailbox itself as "SeaBeam", with no
-    /// agent header, because no crew member wrote it.
-    pub agent: Option<String>,
+    /// The crew member sending, for the `X-SeaBeam-Agent` header (e.g. "tally").
+    pub agent: String,
 }
 
 pub struct GmailAdapter {
@@ -263,6 +256,9 @@ impl GmailAdapter {
     }
 
     /// Send one mail; answers Gmail's message id.
+    // No caller yet: the send surface (who may send, and the person's thumb in
+    // front of it) is open (workers/mvp-gmail-questions.md Q2).
+    #[allow(dead_code)]
     pub async fn send(&self, mail: &OutboundMail) -> Result<String, String> {
         #[derive(serde::Deserialize)]
         struct Sent {
@@ -285,35 +281,29 @@ impl GmailAdapter {
     /// The headers declare an automated sender (crew-email decision, "Headers
     /// say AI"); the body is the sender's own.
     fn rfc822(&self, mail: &OutboundMail) -> Result<String, String> {
-        let (from, from_name) = match &mail.agent {
-            Some(_) => (&self.cfg.send_as, self.cfg.send_as_name.as_str()),
-            None => (&self.cfg.mailbox, SYSTEM_SENDER_NAME),
-        };
         for (name, value) in [
-            ("to", mail.to.as_str()),
-            ("subject", mail.subject.as_str()),
-            ("agent", mail.agent.as_deref().unwrap_or_default()),
-            ("send_as_name", from_name),
+            ("to", &mail.to),
+            ("subject", &mail.subject),
+            ("agent", &mail.agent),
+            ("send_as_name", &self.cfg.send_as_name),
         ] {
             if value.contains(['\r', '\n']) {
                 return Err(format!("gmail send: {name} contains a line break"));
             }
         }
-        let display_name = if from_name.is_ascii() {
-            format!("\"{}\"", from_name.replace('\\', "\\\\").replace('"', "\\\""))
+        let display_name = if self.cfg.send_as_name.is_ascii() {
+            format!(
+                "\"{}\"",
+                self.cfg.send_as_name.replace('\\', "\\\\").replace('"', "\\\"")
+            )
         } else {
-            encoded_words(from_name)
+            encoded_words(&self.cfg.send_as_name)
         };
         let subject = if mail.subject.is_ascii() {
             mail.subject.clone()
         } else {
             encoded_words(&mail.subject)
         };
-        let agent_header = mail
-            .agent
-            .as_ref()
-            .map(|a| format!("X-SeaBeam-Agent: {a}\r\n"))
-            .unwrap_or_default();
         let body = base64::engine::general_purpose::STANDARD.encode(&mail.body);
         let body_lines: Vec<&str> = body
             .as_bytes()
@@ -321,17 +311,19 @@ impl GmailAdapter {
             .map(|c| std::str::from_utf8(c).unwrap_or_default())
             .collect();
         Ok(format!(
-            "From: {display_name} <{from}>\r\n\
+            "From: {display_name} <{}>\r\n\
              To: {}\r\n\
              Subject: {subject}\r\n\
              MIME-Version: 1.0\r\n\
              Content-Type: text/plain; charset=UTF-8\r\n\
              Content-Transfer-Encoding: base64\r\n\
              Auto-Submitted: auto-generated\r\n\
-             {agent_header}\
+             X-SeaBeam-Agent: {}\r\n\
              \r\n\
              {}\r\n",
+            self.cfg.send_as,
             mail.to,
+            mail.agent,
             body_lines.join("\r\n"),
         ))
     }
@@ -340,7 +332,7 @@ impl GmailAdapter {
 /// Keep the watch alive for as long as the task runs: renew daily, retry a
 /// failure after `WATCH_RETRY`. A failed watch stops no other path; sending
 /// does not depend on it.
-pub async fn keep_watch(gmail: Arc<GmailAdapter>) {
+pub async fn keep_watch(gmail: GmailAdapter) {
     loop {
         let wait = match gmail.watch().await {
             Ok(w) => {

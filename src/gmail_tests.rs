@@ -325,7 +325,7 @@ fn mail() -> OutboundMail {
         to: "estimator@example.com".to_string(),
         subject: "Your pricing request".to_string(),
         body: "Hello,\r\nthe base price is attached.\r\n".to_string(),
-        agent: Some("tally".to_string()),
+        agent: "tally".to_string(),
     }
 }
 
@@ -541,77 +541,4 @@ fn a_key_file_without_a_usable_private_key_is_refused() {
 
     assert!(missing.err().unwrap().contains("gmail service account key"));
     assert!(garbage.err().unwrap().contains("private_key"));
-}
-
-#[tokio::test]
-async fn platform_mail_is_from_the_mailbox_itself_with_no_agent_header() {
-    let google = spawn_fake_google(GOOGLE).await;
-
-    google
-        .adapter()
-        .send(&OutboundMail { agent: None, ..mail() })
-        .await
-        .unwrap();
-
-    let message = sent_message(&google);
-    assert_eq!(header_of(&message, "From"), Some("\"SeaBeam\" <hello@seabeam.test>"));
-    assert_eq!(header_of(&message, "Auto-Submitted"), Some("auto-generated"));
-    assert_eq!(header_of(&message, "X-SeaBeam-Agent"), None);
-}
-
-/// The decoded text body of a sent message.
-fn body_of(message: &str) -> String {
-    let body: String = message.split_once("\r\n\r\n").unwrap().1.split("\r\n").collect();
-    String::from_utf8(base64::engine::general_purpose::STANDARD.decode(body).unwrap()).unwrap()
-}
-
-#[tokio::test]
-async fn a_sign_in_mail_carries_the_link_from_the_mailbox() {
-    use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::sign_in_mail::SignInMailHandler;
-    use mailbox_model::types::services::mailbox::mailbox::SendSignInMailRequest;
-
-    let google = spawn_fake_google(GOOGLE).await;
-    let svc = crate::service::SignInMailService::default();
-    svc.set_gmail(Some(Arc::new(google.adapter())));
-    let link = "https://app.example.com/signin/callback?sign_in_link=c2lnbi1pbi1saW5r";
-
-    svc.send_sign_in_mail(
-        None,
-        SendSignInMailRequest {
-            to: "pat@selfhosted.example".to_string(),
-            link: link.to_string(),
-            expires_in_seconds: 900,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    let message = sent_message(&google);
-    assert_eq!(header_of(&message, "To"), Some("pat@selfhosted.example"));
-    assert_eq!(header_of(&message, "From"), Some("\"SeaBeam\" <hello@seabeam.test>"));
-    assert_eq!(header_of(&message, "Subject"), Some("Your SeaBeam sign-in link"));
-    let body = body_of(&message);
-    assert!(body.contains(link), "{body}");
-    assert!(body.contains("within 15 minutes"), "{body}");
-}
-
-#[tokio::test]
-async fn a_sign_in_mail_without_gmail_is_a_failed_precondition() {
-    use mailbox_model::s2sm::internal::grpc::servers::services::mailbox::sign_in_mail::SignInMailHandler;
-    use mailbox_model::types::services::mailbox::mailbox::SendSignInMailRequest;
-
-    let err = crate::service::SignInMailService::default()
-        .send_sign_in_mail(
-            None,
-            SendSignInMailRequest {
-                to: "pat@selfhosted.example".to_string(),
-                link: "https://app.example.com/?sign_in_link=x".to_string(),
-                expires_in_seconds: 900,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }

@@ -1,0 +1,150 @@
+# registry.yaml and vservice-registry.yaml are now authoritative for field IDs.
+registry:
+    gitlab_project_id: "79641700"
+    interfaces:
+        rust: seabeam-controlplane-interfaces
+    imports:
+        java: com.gitlab.seabeam.controlplane.schematic.services.kernel
+tools:
+    go: "1.23"
+    java: "17"
+    node: '>=18.0.0'
+    python: '>=3.8'
+    rust-edition: "2021"
+    typescript: ^5.3.3
+lang:
+    go:
+        dependencies:
+            github.com/caddyserver/certmagic: v0.25.1
+            github.com/dsnet/compress: v0.0.1
+            github.com/gin-contrib/cors: v1.7.6
+            github.com/gin-contrib/zap: v1.1.6
+            github.com/gin-gonic/gin: v1.11.0
+            github.com/golang-jwt/jwt/v5: v5.3.1
+            github.com/graphql-go/graphql: v0.8.1
+            github.com/hashicorp/go-multierror: v1.1.1
+            github.com/jinzhu/copier: v0.4.0
+            github.com/open-policy-agent/opa: v1.13.1
+            github.com/pelletier/go-toml/v2: v2.2.4
+            github.com/soheilhy/cmux: v0.1.5
+            go.uber.org/zap: v1.27.1
+            golang.org/x/crypto: v0.47.0
+            golang.org/x/net: v0.49.0
+            golang.org/x/sync: v0.19.0
+            google.golang.org/genproto/googleapis/rpc: v0.0.0-20260209200024-4cfbd4190f57
+            google.golang.org/grpc: v1.78.0
+            google.golang.org/protobuf: v1.36.11
+            gopkg.in/yaml.v3: v3.0.1
+    java:
+        dependencies:
+            ch.qos.logback:logback-classic: 1.5.29
+            ch.qos.logback:logback-core: 1.5.29
+            com.google.code.gson:gson: 2.13.2
+            com.google.protobuf:protobuf-java: 4.36.2
+            com.google.protobuf:protobuf-java-util: 4.36.2
+            com.hazelcast:hazelcast: 5.5.0
+            com.moandjiezana.toml:toml4j: 0.7.2
+            io.grpc:grpc-netty-shaded: 1.79.0
+            io.grpc:grpc-protobuf: 1.79.0
+            io.grpc:grpc-stub: 1.79.0
+            io.javalin:javalin: 6.7.0
+            io.jsonwebtoken:jjwt-api: 0.13.0
+            io.jsonwebtoken:jjwt-gson: 0.13.0
+            io.jsonwebtoken:jjwt-impl: 0.13.0
+            org.apache.maven.plugins:maven-compiler-plugin: 3.15.0
+            org.apache.maven.plugins:maven-shade-plugin: 3.6.1
+            org.apache.maven.plugins:maven-surefire-plugin: 3.5.4
+            org.apache.tomcat:annotations-api: 6.0.53
+            org.assertj:assertj-core: 3.27.7
+            org.codehaus.mojo:exec-maven-plugin: 3.5.0
+            org.junit.jupiter:junit-jupiter: 6.0.2
+            org.mockito:mockito-core: 5.21.0
+            org.mockito:mockito-junit-jupiter: 5.21.0
+            org.slf4j:slf4j-api: 2.0.17
+            org.slf4j:slf4j-simple: 2.0.17
+            org.yaml:snakeyaml: "2.5"
+            javax.annotation:javax.annotation-api: 1.3.2
+            org.bouncycastle:bcprov-jdk18on: 1.80
+            org.bouncycastle:bcpkix-jdk18on: 1.80
+            org.apache.maven.plugins:maven-antrun-plugin: 3.1.0
+            org.codehaus.mojo:build-helper-maven-plugin: 3.6.0
+            org.apache.commons:commons-compress: 1.28.0
+    typescript:
+        dependencies:
+            '@apollo/server': ^5.4.0
+            '@bufbuild/protobuf': ^2.11.0
+            '@bufbuild/protoc-gen-es': ^2.11.0
+            '@iarna/toml': ^2.2.5
+            '@types/express': ^5.0.6
+            '@types/js-yaml': ^4.0.9
+            axios: ^1.13.5
+            compressjs: ^1.0.3
+            express: ^5.2.1
+            graphql: ^16.12.0
+            js-yaml: ^4.1.0
+            zod: ^4.3.6
+    python:
+        dependencies:
+            PyYAML: '>=6.0.3'
+            cryptography: '>=42.0.0'
+            fastapi: '>=0.128.8'
+            grpcio: '>=1.76.0'
+            httpx: '>=0.28.1'
+            protobuf: '>=7.34.0'
+            pydantic: '>=2.12.5'
+            requests: '>=2.31.0'
+            strawberry-graphql: '>=0.291.3'
+            tomli: '>=2.4.0'
+            tomli-w: '>=1.2.0'
+            urllib3: '>=2.0.0'
+            uvicorn: '>=0.40.0'
+            websockets: '>=15.0.1'
+    rust:
+        dependencies:
+            anyhow: 1.0.101
+            async-graphql: 7.2.1
+            async-graphql-axum: 7.2.1
+            async-trait: 0.1.89
+            axum: 0.8.8
+            base64: 0.21.7
+            bytes: 1.11.1
+            chrono: 0.4.43
+            env_logger: 0.11.8
+            flate2: 1.1.9
+            futures: 0.3.31
+            hyper: 1.8.1
+            jsonwebtoken: 9.3.1
+            log: 0.4.29
+            once_cell: 1.21.3
+            pbjson: 0.8.0
+            pbjson-types: 0.8.0
+            pem: 3.0.6
+            prost: 0.14.1
+            prost-types: 0.14.1
+            prost-wkt-types: 0.7.1
+            regex: 1.12.3
+            reqwest: 0.12.15
+            rustls: 0.23.25
+            rustls-pemfile: 2.2.0
+            serde: 1.0.228
+            serde_json: 1.0.149
+            serde_yaml: 0.9.34
+            thiserror: 1.0.69
+            tinyvec: "=1.12.0"
+            tokio: 1.49.0
+            tokio-rustls: 0.26.4
+            tokio-tungstenite: 0.28.0
+            tokio-stream: 0.1.17
+            tokio-util: 0.7.15
+            tonic: 0.14.0
+            tonic-health: 0.14.0
+            tonic-prost: 0.14.0
+            tonic-prost-build: 0.14.0
+            tower: 0.5.3
+            tower-http: 0.6.8
+            tracing: 0.1.44
+            tracing-subscriber: 0.3.22
+            toml: 0.8.22
+            tokio-test: 0.4.4
+            webpki-roots: 0.26.8
+            x509-cert: 0.2.5

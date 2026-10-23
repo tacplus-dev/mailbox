@@ -1,0 +1,627 @@
+// Mailbox — the pull-delivery index over messaging deliveries.
+//
+// WHAT THIS IS NOT. It is not a second copy of message storage.
+// `messaging.Message` is the permanent record: a c2s query
+// plane generated from `(spec.store_principal)` on `Message.recipient`, and the
+// receipts written against it. A recipient can already read their own
+// deliveries there, body and all.
+//
+// WHAT IT IS, per decisions/big8-p1-item8-mailbox-service-shape-2026-09-01.md:
+// the layer that answers "which deliveries has THIS recipient not yet pulled".
+//
+// It was also the fleet's only consumer of `(spec.ejectionable)` (BIG GOAL 8
+// Phase 0 item 4). That annotation and the HOT/WARM/COLD residency model it
+// gated were both retired by tacplus cd8829fb, and this file was migrated off
+// them on 2026-09-20 — see the record option below and
+// looper/schematic/decisions/stratum-record-lifecycle-2026-09-20.md. Under the
+// one clock there is nothing left for a per-row marker to gate: every row ages
+// out of memory on `residency.idle_seconds` and stays complete and queryable on
+// disk beneath, so an unpulled delivery needs no pin in order to survive.
+//
+// HOW IT ATTACHES. A third consumer group on `messaging.MessageBus.stream`,
+// exactly as messaging.proto's own comment says it would — that file's ONLY
+// edit for this service's arrival is "mailbox" in `Message`'s
+// `s2s_subscribe.auth_services`, which is an authorization decision and
+// deliberately not something a new service grants itself. No field is added to
+// `Message`, no key changes, no publish count changes, and scotty's consumer
+// group is undisturbed: consumer groups are broadcast to independently.
+//
+// ONE CORRECTION TO THE DECISION DOC'S SKETCH, which that doc invited ("read
+// the generator directly rather than take on my word here"): `stratum` has to
+// be in `s2s_subscribe`. The doc wrote `["mailbox"]` with "no other service
+// reads this index". stratum is the record store and auto-derives a
+// subscription to EVERY `(spec.record)` topic
+// (DeriveStoreSubscriptionsFromRegistry); omitting it denies the store on the
+// topic it exists to read — the exact failure accounting-record.proto and
+// agent-sensor.proto were both patched for. Residency is a property of rows IN
+// THE STORE, so a record the store cannot ingest has no lifecycle at all.
+//
+// (A second correction stood here until 2026-09-20: that `ejectionable` was a
+// FIELD marker rather than the `(spec.record)` sub-option the doc sketched. It
+// went away with the annotation it was about.)
+//
+// WHERE ITS ROWS LIVE, since 2026-09-27: stratum, and nowhere else. This
+// service held a `MailboxState` root in kernel until then and read its own rows
+// back out of it. That root is gone, along with the sweep that bounded it, per
+// looper/schematic/decisions/kernel-no-durability-user-data-to-stratum-2026-09-25.md
+// item 3 — a mailbox entry is one person's mail, and kernel holds no user data.
+// The `MailboxEntry` record below was already being published; what changed is
+// that it is now also the thing this service READS, over the file-level
+// `(spec.record_read)` paired with the record's own `s2s_read` grant.
+//
+// Modelled on services/messaging.proto (the producer half of this pair) and on
+// services/letsencrypt.proto (the fleet's first service to read its OWN durable
+// record back through `(spec.record_read)`).
+
+syntax = "proto3";
+
+package mailbox;
+
+import "sys/spec.proto";
+
+// The service ID is assigned in registry.yaml, not here. IDs are GLOBAL across
+// every proto repo merged into a build and the merge hard-errors on collision.
+option (spec.service) = {name: "mailbox"};
+
+// mailbox reads back its OWN durable rows. The grant half is MailboxEntry's
+// `s2s_read` below; neither half works alone (ValidateRecordReadAnnotations
+// refuses either on its own), so the pair is the whole of "this service reads
+// the record store" — there is no other read path and no kernel copy behind it.
+option (spec.record_read) = {record: "mailbox.MailboxEntry"};
+
+// ============================================================================
+// Config
+// ============================================================================
+
+// Config is delivered by kernel at startup and on every change.
+message Config {
+  option (spec.grpc_config) = {service_name: "mailbox"};
+
+  // The topic tacplus SYNTHESIZES from MailboxEntry's spec.record
+  // (mailbox.MailboxEntryBus.stream). Same shape as messaging's: no method_s2s
+  // here, because the producer surface is declared on the record itself and the
+  // generator folds it in — restating it could only drift.
+  option (spec.event_publish) = {
+    topic_ref: "mailbox.MailboxEntryBus.stream"
+  };
+
+  // The consumer half, and the whole reason this service exists. mailbox is a
+  // THIRD consumer group on messaging's topic, alongside stratum's and
+  // scotty's; each group gets its own full copy of every delivery. The group
+  // name is the service label, generated — nothing here names it.
+  option (spec.event_watch) = {
+    topic_ref: "messaging.MessageBus.stream"
+
+    // A watch binding must carry its OWN auth shape — unlike a publish binding,
+    // which may inherit the producer surface from the record. ValidateBinding
+    // says so in as many words ("event_watch must still carry its own
+    // (subscribe) auth"), and it is right to: the producer surface of
+    // messaging's topic names messaging, and inheriting it here would have this
+    // service claim the wrong half of the pair.
+    //
+    // This names MAILBOX because mailbox is the subscriber. It does not GRANT
+    // anything — the grant is `mailbox` in messaging.Message's
+    // s2s_subscribe.auth_services, which lives in messaging's file and is
+    // messaging's decision to make. This is the consumer side saying which
+    // identity it subscribes as; that file is the side saying whether it may.
+    method_s2s: {auth_services: ["mailbox"]}
+  };
+
+  // sweep_interval_seconds is INERT as of 2026-09-27 and is read by nothing.
+  //
+  // It was the cadence of the STATE-ROOT sweep: `MailboxState.entries` was this
+  // service's own root in kernel, nothing else pruned it, and an unbounded one
+  // eventually reached its declared 1,000,000 bound and started refusing
+  // writes. There is no such root any more — the rows live in stratum, whose
+  // bound is disk and whose memory clock is `residency.idle_seconds` below, a
+  // per-type clock this service can neither observe nor set. A sweep from here
+  // would have nothing to sweep.
+  //
+  // WHAT WENT WITH IT: the 90-day `held_since_ms` floor. That age was the STATE
+  // ROOT's bound, not the record's, and no record-side clock replaces it —
+  // `residency.deleted_max_age_seconds` measures a purge from a
+  // `(spec.deleted_flag)` this record does not declare. So a mailbox entry is
+  // now kept for as long as stratum keeps it. See held_since_ms's comment and
+  // workers/mailbox-llmsettings-stratum-result.md; deliberately NOT closed here
+  // by inventing a delete path this migration was not asked for.
+  //
+  // (Until 2026-09-20 the sweep had a second half, reconciling the retired
+  // `ejectionable` marker. That half went first; this is the rest.)
+  //
+  // DECLARED, not deleted, for the same reason retrieved_grace_seconds below is:
+  // kernel holds mailbox's config, and removing a field kernel sets is a
+  // config-compatibility question this migration has no answer for. Both should
+  // be deleted and fields 1 and 2 reserved in a follow-up once nothing in kernel
+  // sets either.
+  int32 sweep_interval_seconds = 1 [
+    (spec.default_int) = 300,
+    (spec.assert_ge) = 10,
+    (spec.assert_le) = 86400
+  ];
+
+  // retrieved_grace_seconds is INERT as of 2026-09-20 and is read by nothing.
+  //
+  // It had exactly one job: to defer the moment the sweep flipped a retrieved
+  // row's `ejectionable` from NEVER to WINDOW, so that a client which acks and
+  // then immediately re-reads still found the row resident. Both ends of that
+  // sentence are gone. The marker went with `spec.Ejectionable`, and residency
+  // is now a per-TYPE idle clock on the row's last touch — a grace period
+  // cannot shift it, because the retrieval write IS the touch.
+  //
+  // DECLARED, not deleted, on purpose: kernel holds mailbox's config, and
+  // removing the field is a config-compatibility question this migration has no
+  // answer for. It should be deleted and field 2 reserved in a follow-up once
+  // nothing in kernel sets it — see
+  // looper/schematic/workers/mailbox-ejectionable-migration-questions.md. The
+  // same now applies to sweep_interval_seconds above.
+  int32 retrieved_grace_seconds = 2 [
+    (spec.default_int) = 0,
+    (spec.assert_ge) = 0,
+    (spec.assert_le) = 604800
+  ];
+
+  // gmail, when set, connects this mailbox to one Google Workspace mailbox
+  // (crew email; sonar/backend decisions/crew-email-2026-09-29.md). Unset, the
+  // service touches no Google API. The service-account key is NOT here: it is
+  // Secrets.gmail_service_account_json.
+  GmailConfig gmail = 3;
+}
+
+// GmailConfig names the Workspace mailbox this service acts as, through a
+// service account with domain-wide delegation scoped to gmail.modify and
+// gmail.send only.
+message GmailConfig {
+  // mailbox is the Workspace user the service account impersonates (the
+  // JWT-bearer `sub`), e.g. hello@seabeam.net. Every Gmail call is made as this
+  // user.
+  string mailbox = 1 [(spec.assert_required) = true, (spec.assert_email) = true];
+
+  // send_as is the From address of every outbound mail, e.g. tally@seabeam.net.
+  // It must be an alias of `mailbox` that Gmail lists as a send-as address;
+  // otherwise Gmail rewrites From to `mailbox`.
+  string send_as = 2 [(spec.assert_required) = true, (spec.assert_email) = true];
+
+  // send_as_name is the From display name, e.g. "Tally for SeaBeam".
+  string send_as_name = 3 [(spec.assert_required) = true, (spec.assert_min_size) = 1];
+
+  // watch_topic is the Pub/Sub topic users.watch publishes inbox changes to,
+  // e.g. projects/jody1-328023/topics/crew-mail-gmail-watch. Gmail refuses the
+  // watch until gmail-api-push@system.gserviceaccount.com holds
+  // roles/pubsub.publisher on it; sending does not depend on it.
+  string watch_topic = 4 [(spec.assert_required) = true, (spec.assert_min_size) = 1];
+}
+
+// Secrets are the mailbox service's secret inputs. They are delivered to the
+// pod as environment variables from a per-service Kubernetes Secret (operator
+// serviceSpec.SecretEnvVars), read with the generated secrets_from_env_var. They
+// are never a field on Config: Config travels in kernel's combined seed, which
+// every config-holder in the fleet can read.
+message Secrets {
+  // gmail_service_account_json is the crew-mail service account's JSON key file
+  // as Google issues it (client_email, private_key, token_uri). Required when
+  // Config.gmail is set.
+  string gmail_service_account_json = 1;
+}
+
+// ============================================================================
+// State
+// ============================================================================
+//
+// THERE IS NONE. mailbox declares no `(spec.service_state)` at all: its only
+// durable rows are `MailboxEntry` in stratum, and the only thing it takes from
+// kernel is `Config` above.
+//
+// A `MailboxState` root stood here until 2026-09-27 holding one `MailboxEntry`
+// per delivery, and its comment gave two reasons the record store could not
+// serve this service's own reads. Both are recorded here corrected rather than
+// deleted, because each was true when written and the reasons they stopped being
+// true are the design:
+//
+//   - "The record query plane's S2S half authorizes exactly one peer audience,
+//     declared in the app's `(spec.trait)` file, and that audience is the record
+//     store itself — a deliberately closed door." True of the TRAIT-WIDE
+//     default, and no longer the only lever: a record may name its own readers
+//     with `(spec.record).s2s_read`, which the reading service pairs with a
+//     file-level `(spec.record_read)`. That mechanism did not exist when the
+//     comment was written — letsencrypt landed the fleet's first use of it on
+//     2026-09-25 (bc2e0af), blobstore the second — and using it touches no other
+//     repo's trait declaration.
+//   - "Rebuild an in-memory index by replaying its own topic ... a Message replay
+//     that lands after the MailboxEntry replay for the same delivery_id would
+//     write a RETRIEVED row back to HELD." The replay index was never built and
+//     is not what replaced kernel state: this service reads the STORE, which is
+//     complete without a replay. The ordering hazard survives in a much narrower
+//     form — a replayed Message whose row was retrieved within the last ingest
+//     hop can still be re-held — and is stated at `on_message` in the service
+//     rather than papered over here.
+//
+// READ-YOUR-OWN-WRITE, which is what the state root was really being kept for,
+// is served by the store instead (Jody, 2026-09-27): a write publishes and then
+// point-reads the row back with a short retry, so the caller-facing RPC acks
+// only once stratum's ingest has landed it, and the eventbus hop is
+// milliseconds. If retry-until-visible ever proves insufficient in practice the
+// answer is a synchronous publish-and-read helper in the record plane, generic
+// and built once — not a state root here.
+
+// MailboxEntryStatus is the two-state life of an entry. There is no EVICTED
+// state, and that absence is the design: eviction is the record store's memory
+// management, on a clock this service cannot observe, and a status written here
+// would be this service making a claim about somebody else's RAM.
+//
+// TOP-LEVEL, not nested inside MailboxEntry, and that is not style. A nested
+// enum is the ONE shape in this fleet nothing had used — every enum in
+// platform/proto and scotty/proto is top-level — and generating one emits Rust
+// helpers referring to a type `MailboxEntry_Status` that prost never declares
+// (it renders `mailbox_entry::Status`), so the model crate does not compile.
+// Reported in workers/big8-p1-mailbox-questions.md rather than patched around
+// in the generator, which this task has no mandate to change. The naming
+// follows scotty.SkillClassification: the enum's own name as the value prefix.
+enum MailboxEntryStatus {
+  MAILBOX_ENTRY_STATUS_UNSPECIFIED = 0;
+
+  // HELD: the delivery arrived on the topic and nobody has pulled it. Age alone
+  // does not change that, and no longer needs a marker to say so: an unpulled
+  // row may leave the store's MEMORY like any other and loses nothing by it —
+  // it stays complete and queryable on disk, and the next read reloads it.
+  // NOTHING removes a HELD row: the 90-day `held_since_ms` floor that used to
+  // was the kernel state root's bound, and the root went away with it on
+  // 2026-09-27 — see Config.sweep_interval_seconds.
+  MAILBOX_ENTRY_STATUS_HELD = 1;
+
+  // RETRIEVED: the recipient acknowledged pulling it. Terminal in the normal
+  // path — `ListHeldMail` stops returning the row and `UpdateHeldMail` is a
+  // no-op on it — so this is the row's last write, and therefore where its
+  // residency idle clock starts running down.
+  MAILBOX_ENTRY_STATUS_RETRIEVED = 2;
+}
+
+// ============================================================================
+// MailboxEntry — the row, and the record
+// ============================================================================
+
+// MailboxEntry is ONE DELIVERY'S mailbox state, keyed by the SAME delivery_id
+// as the `messaging.Message` it tracks.
+//
+// Joinable by identity, not by a second lookup: an entry and its message share
+// a key, so "fetch the body of the mail I was just told about" is one Message
+// read with an id the client already holds.
+//
+// IT HOLDS NO BODY. `messaging.Message.text` is never copied here — that is the
+// decision doc's rejected alternative ("Mailbox stores full message content"),
+// and it stands. What IS carried is the inbox SUMMARY LINE the doc's own
+// ListHeldMail spec enumerates (sender, subject, sent_at_ms): a mail client
+// renders a list before anything is opened, and those three fields are the only
+// way to serve that list without a second round trip per row. A summary line is
+// not a second copy of the message, and the field that would make it one —
+// `text` — is absent, as are `recipients` and `ticket_id`.
+message MailboxEntry {
+  option (spec.record) = {
+    // The SAME key as messaging.Message: one entry per delivery.
+    key: "delivery_id"
+    owner: "spiffe_id"
+
+    // PRODUCER surface: mailbox is the only writer. Nothing else has any
+    // business asserting that a delivery has been retrieved.
+    s2s: {auth_services: ["mailbox"]}
+
+    // CONSUMER surface: stratum, the record store, and nobody else. See the
+    // correction at the top of this file — the doc's `["mailbox"]` would have
+    // denied the store on the topic it auto-subscribes to, leaving the record
+    // unstored and `residency` below with no rows to govern.
+    s2s_subscribe: {auth_services: ["stratum"]}
+
+    // STORED-ROW READ: mailbox reads its own rows back. Paired with the
+    // file-level `(spec.record_read)` at the top of this file, and a SEPARATE
+    // grant from `s2s_subscribe` above — that one says who may receive the rows
+    // as they are published, this one says who may ask the store for rows it
+    // already holds. mailbox needs the second and not the first: it is the
+    // publisher, so it has every row as it happens, and what it could not do
+    // before this grant existed was ask "which of them are still HELD" after a
+    // restart. Naming only mailbox is the whole audience — stratum reads its own
+    // store directly and no third service has any business here.
+    s2s_read: {auth_services: ["mailbox"]}
+
+    // LIFECYCLE — ONE CLOCK, per
+    // looper/schematic/decisions/stratum-record-lifecycle-2026-09-20.md. This
+    // block replaces BOTH annotations that stood here until 2026-09-20: the
+    // `retention: {held_since_ms, 90 days}` delete clock and the WARM
+    // `residency: {window: ...}` preset. tacplus cd8829fb retired them together
+    // and REUSED ResidencyPolicy field numbers 1 and 2 rather than reserving
+    // them, so either old spelling is now a hard protoc error and not an option
+    // silently dropped. The per-row `ejectionable` gate went in the same commit;
+    // there is no per-row half of this any more, and field 10 below is reserved
+    // where it stood.
+    //
+    // idle_seconds 86400 — one day; the platform default
+    // (parser.DefaultResidencyIdleSeconds) stated rather than left at 0, because
+    // a number an author chose and a number an author omitted should not look
+    // identical in the file. Residency buys exactly one thing: that the STORE's
+    // copy of a row answers a query-plane read without a disk load — and since
+    // 2026-09-27 that read is THIS SERVICE'S, not only a third party's, because
+    // `ListHeldMail`, `UpdateHeldMail` and the read-after-write point read all
+    // go through the plane now that there is no kernel copy. Eviction still
+    // costs nothing but a disk load: the row stays complete and queryable
+    // beneath. A delivery is pulled within minutes or hours of arrival or it is
+    // not being pulled today, so a full day with neither a read nor a write is
+    // already well past the point where keeping the row in RAM pays for itself.
+    //
+    // A HELD row ages out on this clock like any other, and that is the whole
+    // ruling: what EJECTIONABLE_NEVER pinned undelivered mail against was memory
+    // eviction, and memory eviction destroys nothing — the row stays complete
+    // and queryable on disk and the next `ListHeldMail` that touches it reloads
+    // it. There was never anything to protect against.
+    //
+    // deleted_max_age_seconds 2592000 — thirty days; likewise the platform
+    // default (parser.DefaultResidencyDeletedMaxAgeSeconds), and INERT on this
+    // type. The purge clock measures rows whose (spec.deleted_flag) bool is set;
+    // this record declares none and needs none, so it counts nothing here. It is
+    // carried anyway because ResidencyPolicy asks for exactly that — "a type
+    // that later gains the marker should not also have to gain a number" — and
+    // because 0 is not a spelling of "never": 0 means "use the default", which
+    // is this same number.
+    residency: {idle_seconds: 86400 deleted_max_age_seconds: 2592000}
+  };
+
+  // delivery_id is the record key and messaging.Message.delivery_id verbatim.
+  // Bounded identically (512) — a shorter bound here would silently drop the
+  // deliveries whose recipient subject is long.
+  string delivery_id = 1 [
+    (spec.indexed) = true,
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 512
+  ];
+
+  // message_id groups the N entries of one submission, the same way it groups
+  // the N Messages. EQ-filterable for the same reason it is there.
+  string message_id = 2 [
+    (spec.assert_max_size) = 128,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // recipient is whose mailbox this is, and the ROW'S OWNING PRINCIPAL — the
+  // same field, carrying the same annotation, as messaging.Message.recipient.
+  // The generated egress filter holds a caller's reads to their own rows, so
+  // ListHeldMail cannot return one person's mail to another even if this
+  // service's own predicate were wrong.
+  //
+  // spiffe_id below is the record's declared owner but is the PUBLISHER —
+  // mailbox's own service identity, stamped by eventbus — so it is the wrong
+  // field to filter a user's reads on, exactly as it is on Message.
+  string recipient = 3 [
+    (spec.store_principal) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  MailboxEntryStatus status = 4 [(spec.assert_enum_defined) = true];
+
+  // held_since_ms is when this consumer group's copy landed. It is NOT a
+  // residency clock — residency runs on the row's last touch, which is
+  // store_epoch_ms and is the store's business, not a business field's. It is
+  // not an expiry clock either, as of 2026-09-27: the state-root sweep it used
+  // to drive is gone with the state root, and no record-side clock replaced it
+  // (see Config.sweep_interval_seconds). What survives is the question a user
+  // asks with it — "how long has this been sitting in my mailbox" — and the
+  // ordering `ListHeldMail` presents.
+  //
+  // RANGE-filterable because "what has been sitting in my mailbox since last
+  // week" is a question about this field.
+  int64 held_since_ms = 5 [
+    (spec.assert_ge) = 0,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  // retrieved_at_ms is unset until retrieved: when the recipient took it, which
+  // is what a read inbox sorts by and what UpdateHeldMail's idempotency is
+  // stated in terms of (the FIRST retrieval's timestamp stands).
+  //
+  // It gates nothing in this service any more. Until 2026-09-20 it was the
+  // clock the eviction-eligibility mark was measured from; that mark went with
+  // `ejectionable`, and the residency clock that replaced it counts from the
+  // row's last WRITE — which, for a retrieved row, is the retrieval itself. The
+  // field survives because "when did I take this" is the user's question and
+  // does not stop being worth answering.
+  int64 retrieved_at_ms = 6 [(spec.assert_ge) = 0];
+
+  // --- the inbox summary line, copied from the Message at arrival -----------
+  //
+  // Three fields, and no more. See the message-level comment: this is what an
+  // inbox list renders, not what an opened message shows.
+
+  // sender is messaging.Message.sender — the authenticated principal that sent
+  // it, never a caller-written string on either side.
+  string sender = 7 [
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // subject is the subject line. Bounded identically to Message.subject.
+  string subject = 8 [(spec.assert_max_size) = 512];
+
+  // sent_at_ms is the sender's clock, carried through so an inbox can sort by
+  // when a message was SENT rather than by when this consumer group happened to
+  // process it. The two differ by broker latency and by any replay.
+  int64 sent_at_ms = 9 [(spec.assert_ge) = 0];
+
+  // --- the store's clock ---------------------------------------------------
+
+  // Field 10 held `spec.Ejectionable ejectionable`, this record's original
+  // reason to exist and the fleet's only per-row eviction gate. tacplus cd8829fb
+  // deleted the enum and its extension; the one-clock model in the record option
+  // above has no per-row half to replace it with, and needs none. Reserved
+  // rather than reused: this record is published on a topic, and a new field
+  // silently inheriting a retired field's number is how a replayed row means
+  // something it never said.
+  reserved 10;
+  reserved "ejectionable";
+
+  // store_epoch_ms is the row's LAST WRITE, stamped by the generated wrapper
+  // and never by this service. It is the record's durable write clock: what the
+  // disk leg ranges on, and what `residency.deleted_max_age_seconds` would
+  // measure a delete from if this type had a (spec.deleted_flag). The memory
+  // idle clock also counts READS, which no field can see — which is precisely
+  // why residency is a property of the type and not of the row.
+  //
+  // RANGE per (spec.store_epoch)'s own contract — it is the predicate a
+  // two-leg memory/disk query partitions on.
+  int64 store_epoch_ms = 11 [
+    (spec.store_epoch) = true,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  // spiffe_id is the record owner, and the name is LOAD-BEARING: eventbus's
+  // topic discovery matches the literal field name "spiffe_id" of string type
+  // when deciding which topics get publisher-identity stamping.
+  //
+  // It holds MAILBOX'S OWN service identity — this service is the publisher.
+  // `recipient` above is where the person is.
+  string spiffe_id = 12 [
+    (spec.identity_spiffe_subject) = true,
+    (spec.assert_max_size) = 1024,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // namespace is the row's owning TENANT, by EXACT string equality against the
+  // caller's namespace claim. MANDATORY: tacplus fails generation for any
+  // (spec.record) declaring no such field, on the reasoning that the record
+  // nobody remembered to annotate is exactly the one that leaks.
+  //
+  // Its value is copied from the Message that produced this entry rather than
+  // resolved again: the tenant of a mailbox entry IS the tenant of the delivery
+  // it tracks, and re-deriving it from mailbox's own service token would stamp
+  // the SERVICE's tenant onto a USER's row.
+  //
+  // Not a (spec.query_field): the field exists to be the egress boundary, and a
+  // boundary a caller can name in a predicate is not one.
+  string namespace = 13 [
+    (spec.store_namespace) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+// ============================================================================
+// Service
+// ============================================================================
+
+// Mailbox is user-facing: a recipient asks it what is being held for them and
+// tells it what they have taken.
+service Mailbox {
+  option (spec.service_c2s) = {auth_entitled_users: true};
+
+  // ListHeldMail returns the deliveries still HELD for the calling recipient.
+  //
+  // It is the "do I have new mail" poll, and it returns no message body — only
+  // enough to know what to fetch from messaging. See MailboxEntry's comment.
+  rpc ListHeldMail(ListHeldMailRequest) returns (ListHeldMailResponse) {
+    option (spec.rpc) = {principal: RPC_PRINCIPAL_USER};
+
+    // A collection read must declare this — the verb registry's own boundary
+    // note for List. 100 rows of a body-less summary is well inside the 1MB
+    // unary tier; scotty's fatter Ticket rows sit at 150.
+    option (spec.method_collection) = {
+      mode: COLLECTION_MODE_SNAPSHOT,
+      order_by: ["delivery_id"],
+      max_items: 100
+    };
+  }
+
+  // UpdateHeldMail marks deliveries RETRIEVED, which is what takes them out of
+  // `ListHeldMail`'s answer.
+  //
+  // NOT `RetrieveMail`, which is what the decision doc calls it. The RPC verb
+  // registry is CLOSED (tacplus/pkg/internal/common/verbs/registry.json) and
+  // `Retrieve` is neither a registered verb nor a folded synonym of one, so
+  // that name does not generate at all — verbs.Classify hard-fails any c2s
+  // method whose leading verb is unregistered. This is the same trap item 5 hit
+  // with `Submit` (resolved there to `Send`). `Update` is the registered verb
+  // whose definition is this operation — "modify an existing resource" — and
+  // the rows it modifies are the ones `ListHeldMail` just returned, so the pair
+  // reads as one noun with two verbs. Nothing about the semantics the doc
+  // settled changes: the operation, its idempotency and its effect on
+  // `retrieved_at_ms` are exactly as specified there.
+  //
+  // IDEMPOTENT. Naming an id that is already RETRIEVED is a no-op, not an
+  // error: a client polling on reconnect must not fail on ids it already acked,
+  // and the FIRST retrieval's timestamp is the one that stands — a second call
+  // must not rewrite when the recipient took the mail.
+  rpc UpdateHeldMail(UpdateHeldMailRequest) returns (UpdateHeldMailResponse) {
+    option (spec.rpc) = {principal: RPC_PRINCIPAL_USER};
+  }
+}
+
+message ListHeldMailRequest {
+  // recipient is (spec.principal): the generated wrapper resolves the
+  // authenticated caller's subject and stamps it when empty, accepts it when it
+  // matches, and refuses with INVALID_ARGUMENT when it differs. A caller
+  // therefore cannot read someone else's mailbox, and the handler does not
+  // check — there is nothing left to check.
+  string recipient = 1 [
+    (spec.principal) = true,
+    (spec.assert_max_size) = 256
+  ];
+
+  // namespace is (spec.namespace): the same stamp/accept/refuse control on the
+  // caller's tenant claim. It is declared on a READ here, unlike scotty's MCP
+  // audit rpc which omits it, because this handler does not merely return rows
+  // for the generated egress filter to police — it selects them out of the
+  // record store by predicate, and the predicate needs the caller's verified
+  // tenant. Necessary rather than belt-and-braces: mailbox reads the record
+  // plane's S2S half as a `/system` peer, which that plane deliberately leaves
+  // UNPINNED (a fleet-wide read, see javaNamespaceResolve's runtime gate), so
+  // the tenant narrowing on this path is this handler's to apply.
+  string namespace = 2 [
+    (spec.namespace) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message ListHeldMailResponse {
+  // The held entries, newest arrival last. Carrying the record type rather than
+  // a hand-rolled summary struct is deliberate: `(spec.store_principal)` and
+  // `(spec.store_namespace)` filter repeated fields OF THAT RECORD TYPE on the
+  // way out, so a bespoke response row would be a read path with the generated
+  // backstop switched off.
+  repeated MailboxEntry entries = 1 [(spec.assert_max_size) = 100];
+}
+
+message UpdateHeldMailRequest {
+  // recipient is (spec.principal) — see ListHeldMailRequest. It is what makes
+  // "retrieve MY mail" unable to name anybody else's delivery, before the
+  // handler runs.
+  string recipient = 1 [
+    (spec.principal) = true,
+    (spec.assert_max_size) = 256
+  ];
+
+  // delivery_ids are the deliveries being acknowledged. Bounded to the page
+  // ListHeldMail hands out, because acking a page you were just given is the
+  // shape this RPC is for.
+  repeated string delivery_ids = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 100
+  ];
+
+  // namespace is (spec.namespace) — the write half of the tenant pair. This RPC
+  // WRITES rows, so the marker is doing its primary job here: binding the value
+  // the handler then holds a row's own stamped namespace against.
+  string namespace = 3 [
+    (spec.namespace) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message UpdateHeldMailResponse {
+  // retrieved_delivery_ids is what this call actually changed from HELD to
+  // RETRIEVED — a SUBSET of the request's ids, and the difference is the point.
+  // An id that was already retrieved, or that names no entry of the caller's,
+  // is absent here rather than an error, so a client can tell "I acked this
+  // just now" from "this was already acked" without either being a failure.
+  repeated string retrieved_delivery_ids = 1 [(spec.assert_max_size) = 100];
+
+  // retrieved_at_ms is the timestamp stamped on the entries this call retrieved
+  // — one clock for the call, the same way messaging takes one sent_at_ms for a
+  // whole submission. Zero when the call retrieved nothing.
+  int64 retrieved_at_ms = 2;
+}

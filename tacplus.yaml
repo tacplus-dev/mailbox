@@ -1,6 +1,9 @@
+kind: service
 language: rust
+# pkg kept as copied so the hand-written code keeps compiling; moves with the packages later.
 pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox
 output-dir: target/generated-sources
-src: https://gitlab.com/seabeam/schematic/platform/proto.git
+src: proto
 header: |
-  Copyright (c) 2026 Seabeam LLC. All rights reserved.
+  Copyright (c) 2026 Jody Scott
+  SPDX-License-Identifier: Apache-2.0

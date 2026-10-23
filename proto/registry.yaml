@@ -1,0 +1,8 @@
+# Managed by tacplus — do not edit IDs manually.
+registries:
+    - https://github.com/tacplus-dev/registry.git
+services:
+    - name: mailbox
+      id: 55
+      contract: https://gitlab.com/seabeam/schematic/platform/proto.git
+      visibility: private

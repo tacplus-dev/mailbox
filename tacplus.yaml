@@ -7,6 +7,8 @@ src: proto
 # records here declare residency; the record query plane that reads them is the
 # query trait hosted by stratum, so stratum's contract is part of this build.
 depends:
+  # topics declared here publish through the eventbus broker.
+  - eventbus
   - stratum
   # mailbox.Config subscribes to messaging.MessageBus.stream.
   - messaging

@@ -4,6 +4,10 @@ language: rust
 pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox
 output-dir: target/generated-sources
 src: proto
+# records here declare residency; the record query plane that reads them is the
+# query trait hosted by stratum, so stratum's contract is part of this build.
+depends:
+  - stratum
 header: |
   Copyright (c) 2026 Jody Scott
   SPDX-License-Identifier: Apache-2.0

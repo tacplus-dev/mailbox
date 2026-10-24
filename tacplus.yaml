@@ -8,6 +8,8 @@ src: proto
 # query trait hosted by stratum, so stratum's contract is part of this build.
 depends:
   - stratum
+  # mailbox.Config subscribes to messaging.MessageBus.stream.
+  - messaging
 header: |
   Copyright (c) 2026 Jody Scott
   SPDX-License-Identifier: Apache-2.0

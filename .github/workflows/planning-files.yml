@@ -1,0 +1,12 @@
+# The planning files check (tacplus-dev/roadmap decisions/repo-roadmap-files-2026-10-27.md):
+# STATE.md, PROPOSALS.md and HISTORY.md exist and HISTORY.md is append-only. See tacplus-dev/looper.
+name: planning-files
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+permissions:
+  contents: read
+jobs:
+  planning-files:
+    uses: tacplus-dev/looper/.github/workflows/planning-files.yml@main

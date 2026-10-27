@@ -1,4 +1,6 @@
 kind: service
+# compiler floor: the looper runs the latest 2.4.x image (tacplus#161).
+tacplus: "2.4"
 language: rust
 # pkg kept as copied so the hand-written code keeps compiling; moves with the packages later.
 pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox

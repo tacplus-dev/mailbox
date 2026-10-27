@@ -1157,9 +1157,9 @@ async fn gmail_config_without_the_service_account_key_is_refused() {
     let h = Harness::start().await;
     let handler = crate::service::MailboxServiceHandler::new(h.svc.clone());
     let gmail = mailbox::GmailConfig {
-        mailbox: "hello@seabeam.test".to_string(),
-        send_as: "tally@seabeam.test".to_string(),
-        send_as_name: "Tally for SeaBeam".to_string(),
+        mailbox: "hello@example.test".to_string(),
+        send_as: "tally@example.test".to_string(),
+        send_as_name: "Tally".to_string(),
         watch_topic: "projects/p/topics/t".to_string(),
         ..Default::default()
     };

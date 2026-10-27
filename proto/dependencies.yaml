@@ -1,10 +1,4 @@
 # registry.yaml and vservice-registry.yaml are now authoritative for field IDs.
-registry:
-    gitlab_project_id: "79641700"
-    interfaces:
-        rust: seabeam-controlplane-interfaces
-    imports:
-        java: com.gitlab.seabeam.controlplane.schematic.services.kernel
 tools:
     go: "1.23"
     java: "17"

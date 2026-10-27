@@ -1,6 +1,6 @@
 //! Crew email over Gmail: the company mailbox, watched and sent from.
 //!
-//! sonar/backend decisions/crew-email-2026-09-29.md: Google carries the mail and
+//! The crew-email decision (2026-09-29): Google carries the mail and
 //! this service never runs an MTA. One Workspace mailbox per company
 //! (`GmailConfig.mailbox`), reached through the crew-mail service account with
 //! domain-wide delegation, scoped to gmail.modify + gmail.send and nothing else.
@@ -113,7 +113,7 @@ pub struct OutboundMail {
     pub to: String,
     pub subject: String,
     pub body: String,
-    /// The crew member sending, for the `X-SeaBeam-Agent` header (e.g. "tally").
+    /// The crew member sending, for the `X-Mailbox-Agent` header (e.g. "tally").
     pub agent: String,
 }
 
@@ -318,7 +318,7 @@ impl GmailAdapter {
              Content-Type: text/plain; charset=UTF-8\r\n\
              Content-Transfer-Encoding: base64\r\n\
              Auto-Submitted: auto-generated\r\n\
-             X-SeaBeam-Agent: {}\r\n\
+             X-Mailbox-Agent: {}\r\n\
              \r\n\
              {}\r\n",
             self.cfg.send_as,

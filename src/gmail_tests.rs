@@ -52,8 +52,8 @@ const TEST_SA_PEM: &str = concat!(
 );
 
 const SA_EMAIL: &str = "crew-mail@test-project.iam.gserviceaccount.com";
-const MAILBOX: &str = "hello@seabeam.test";
-const SEND_AS: &str = "tally@seabeam.test";
+const MAILBOX: &str = "hello@example.test";
+const SEND_AS: &str = "tally@example.test";
 const TOPIC: &str = "projects/test-project/topics/crew-mail-gmail-watch";
 const SCOPES: &str =
     "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
@@ -62,7 +62,7 @@ pub(crate) fn gmail_config() -> GmailConfig {
     GmailConfig {
         mailbox: MAILBOX.to_string(),
         send_as: SEND_AS.to_string(),
-        send_as_name: "Tally for SeaBeam".to_string(),
+        send_as_name: "Tally".to_string(),
         watch_topic: TOPIC.to_string(),
         ..Default::default()
     }
@@ -401,7 +401,7 @@ async fn an_assertion_google_refuses_fails_before_any_gmail_call() {
     let google = spawn_fake_google(GOOGLE).await;
     // Same key, wrong mailbox: Google refuses a delegation it was not granted.
     let cfg = GmailConfig {
-        mailbox: "someone-else@seabeam.test".to_string(),
+        mailbox: "someone-else@example.test".to_string(),
         ..gmail_config()
     };
     let gmail = GmailAdapter::new(&cfg, &key_file(&google.token_uri()), &google.base).unwrap();
@@ -461,11 +461,11 @@ async fn send_is_from_the_alias_and_declares_an_automated_sender() {
 
     assert_eq!(id, "sent-1");
     let message = sent_message(&google);
-    assert_eq!(header_of(&message, "From"), Some("\"Tally for SeaBeam\" <tally@seabeam.test>"));
+    assert_eq!(header_of(&message, "From"), Some("\"Tally\" <tally@example.test>"));
     assert_eq!(header_of(&message, "To"), Some("estimator@example.com"));
     assert_eq!(header_of(&message, "Subject"), Some("Your pricing request"));
     assert_eq!(header_of(&message, "Auto-Submitted"), Some("auto-generated"));
-    assert_eq!(header_of(&message, "X-SeaBeam-Agent"), Some("tally"));
+    assert_eq!(header_of(&message, "X-Mailbox-Agent"), Some("tally"));
     assert_eq!(header_of(&message, "Content-Transfer-Encoding"), Some("base64"));
     let body: String = message
         .split_once("\r\n\r\n")

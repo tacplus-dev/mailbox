@@ -2,8 +2,8 @@ kind: service
 # compiler floor: the looper runs the latest 2.4.x image (tacplus#161).
 tacplus: "2.4"
 language: rust
-# pkg kept as copied so the hand-written code keeps compiling; moves with the packages later.
-pkg: com.gitlab.seabeam.controlplane.schematic.services.mailbox
+# Rust takes only pkg's last segment: the crate stays mailbox-model.
+pkg: com.github.tacplusdev.mailbox
 output-dir: target/generated-sources
 src: proto
 # records here declare residency; the record query plane that reads them is the

@@ -4,5 +4,5 @@ registries:
 services:
     - name: mailbox
       id: 55
-      contract: https://gitlab.com/seabeam/schematic/platform/proto.git
-      visibility: private
+      contract: https://github.com/tacplus-dev/mailbox.git
+      visibility: public

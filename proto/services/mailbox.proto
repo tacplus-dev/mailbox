@@ -23,8 +23,8 @@
 // edit for this service's arrival is "mailbox" in `Message`'s
 // `s2s_subscribe.auth_services`, which is an authorization decision and
 // deliberately not something a new service grants itself. No field is added to
-// `Message`, no key changes, no publish count changes, and scotty's consumer
-// group is undisturbed: consumer groups are broadcast to independently.
+// `Message`, no key changes, no publish count changes, and the other consumer
+// groups are undisturbed: consumer groups are broadcast to independently.
 //
 // ONE CORRECTION TO THE DECISION DOC'S SKETCH, which that doc invited ("read
 // the generator directly rather than take on my word here"): `stratum` has to
@@ -86,9 +86,9 @@ message Config {
   };
 
   // The consumer half, and the whole reason this service exists. mailbox is a
-  // THIRD consumer group on messaging's topic, alongside stratum's and
-  // scotty's; each group gets its own full copy of every delivery. The group
-  // name is the service label, generated — nothing here names it.
+  // consumer group of its own on messaging's topic, alongside stratum's; each
+  // group gets its own full copy of every delivery. The group name is the
+  // service label, generated — nothing here names it.
   option (spec.event_watch) = {
     topic_ref: "messaging.MessageBus.stream"
 
@@ -161,7 +161,7 @@ message Config {
   ];
 
   // gmail, when set, connects this mailbox to one Google Workspace mailbox
-  // (crew email; sonar/backend decisions/crew-email-2026-09-29.md). Unset, the
+  // (crew email; the crew-email decision of 2026-09-29). Unset, the
   // service touches no Google API. The service-account key is NOT here: it is
   // Secrets.gmail_service_account_json.
   GmailConfig gmail = 3;
@@ -172,16 +172,16 @@ message Config {
 // gmail.send only.
 message GmailConfig {
   // mailbox is the Workspace user the service account impersonates (the
-  // JWT-bearer `sub`), e.g. hello@seabeam.net. Every Gmail call is made as this
+  // JWT-bearer `sub`), e.g. hello@example.com. Every Gmail call is made as this
   // user.
   string mailbox = 1 [(spec.assert_required) = true, (spec.assert_email) = true];
 
-  // send_as is the From address of every outbound mail, e.g. tally@seabeam.net.
+  // send_as is the From address of every outbound mail, e.g. tally@example.com.
   // It must be an alias of `mailbox` that Gmail lists as a send-as address;
   // otherwise Gmail rewrites From to `mailbox`.
   string send_as = 2 [(spec.assert_required) = true, (spec.assert_email) = true];
 
-  // send_as_name is the From display name, e.g. "Tally for SeaBeam".
+  // send_as_name is the From display name, e.g. "Tally".
   string send_as_name = 3 [(spec.assert_required) = true, (spec.assert_min_size) = 1];
 
   // watch_topic is the Pub/Sub topic users.watch publishes inbox changes to,
@@ -250,12 +250,12 @@ message Secrets {
 //
 // TOP-LEVEL, not nested inside MailboxEntry, and that is not style. A nested
 // enum is the ONE shape in this fleet nothing had used — every enum in
-// platform/proto and scotty/proto is top-level — and generating one emits Rust
+// the fleet's protos is top-level — and generating one emits Rust
 // helpers referring to a type `MailboxEntry_Status` that prost never declares
 // (it renders `mailbox_entry::Status`), so the model crate does not compile.
 // Reported in workers/big8-p1-mailbox-questions.md rather than patched around
 // in the generator, which this task has no mandate to change. The naming
-// follows scotty.SkillClassification: the enum's own name as the value prefix.
+// follows the fleet's other enums: the enum's own name as the value prefix.
 enum MailboxEntryStatus {
   MAILBOX_ENTRY_STATUS_UNSPECIFIED = 0;
 
@@ -519,7 +519,7 @@ service Mailbox {
 
     // A collection read must declare this — the verb registry's own boundary
     // note for List. 100 rows of a body-less summary is well inside the 1MB
-    // unary tier; scotty's fatter Ticket rows sit at 150.
+    // unary tier; fatter rows elsewhere in the fleet sit at 150.
     option (spec.method_collection) = {
       mode: COLLECTION_MODE_SNAPSHOT,
       order_by: ["delivery_id"],
@@ -563,8 +563,8 @@ message ListHeldMailRequest {
   ];
 
   // namespace is (spec.namespace): the same stamp/accept/refuse control on the
-  // caller's tenant claim. It is declared on a READ here, unlike scotty's MCP
-  // audit rpc which omits it, because this handler does not merely return rows
+  // caller's tenant claim. It is declared on a READ here, unlike reads that
+  // omit it, because this handler does not merely return rows
   // for the generated egress filter to police — it selects them out of the
   // record store by predicate, and the predicate needs the caller's verified
   // tenant. Necessary rather than belt-and-braces: mailbox reads the record

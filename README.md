@@ -38,7 +38,7 @@ clock replaced it. Mailbox entries are now kept for as long as stratum keeps
 them.
 
 - Proto: `platform/proto/services/mailbox.proto`
-- Language: Rust (matching messaging and scotty)
+- Language: Rust (matching messaging)
 - Build: `tacplus build` via the app's `build.sh`, not a bare `just generate` —
   this service needs the app proto set alongside the platform's
 - Design: `platform/decisions/big8-p1-item8-mailbox-service-shape-2026-09-01.md`

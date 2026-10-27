@@ -39,8 +39,12 @@ them.
 
 - Proto: `platform/proto/services/mailbox.proto`
 - Language: Rust (matching messaging)
-- Build: `tacplus build` via the app's `build.sh`, not a bare `just generate` —
-  this service needs the app proto set alongside the platform's
+- Build: `just generate` runs `tacplus build` on the floor and `depends` that
+  `tacplus.yaml` declares; `just gates` is the check to run before pushing
+  (and what the looper and nightly scanner run): fresh generation, a check that
+  nothing under `target/` is tracked and that `proto/registry.yaml` is
+  unchanged, then `cargo build --locked` and `cargo test --locked`. It exits
+  non-zero if any step fails
 - Design: `platform/decisions/big8-p1-item8-mailbox-service-shape-2026-09-01.md`
   and `workers/big8-p1-mailbox-result.md` (which records the two corrections
   that decision doc invited, and what the sweep actually does)

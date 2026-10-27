@@ -1,4 +1,5 @@
-# Local development builds only — not used in CI/CD.
+# Builds this service standalone from its own repository (tacplus.yaml: floor
+# and depends). The looper and the nightly scanner run `just gates`.
 
 TACPLUS := env_var_or_default("TACPLUS_BIN", "tacplus")
 
@@ -10,7 +11,7 @@ generate:
   {{TACPLUS}} build --tag latest
 
 # Every later issue (ports, releases) runs this: fresh generation, then the
-# generated-code checks, build and test.
+# generated-code checks, build and test. Exits non-zero if any step fails.
 gates: generate
   #!/usr/bin/env bash
   set -euo pipefail

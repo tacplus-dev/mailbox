@@ -21,10 +21,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::sha2::Sha256;
-use rsa::signature::{SignatureEncoding, Signer};
+use ring::rand::SystemRandom;
+use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::PrivatePkcs8KeyDer;
 
 use mailbox_model::types::services::mailbox::mailbox::GmailConfig;
 
@@ -123,7 +123,8 @@ pub struct GmailAdapter {
     cfg: GmailConfig,
     client_email: String,
     token_uri: String,
-    key: SigningKey<Sha256>,
+    key: RsaKeyPair,
+    rng: SystemRandom,
     /// The current access token and its expiry (unix seconds).
     token: tokio::sync::Mutex<Option<(String, i64)>>,
 }
@@ -135,8 +136,12 @@ impl GmailAdapter {
         let sa: ServiceAccountKey = serde_json::from_str(service_account_json)
             .map_err(|e| format!("gmail service account key: {e}"))?;
         // Google signs nothing but RS256 here, so the key is used directly: the
-        // chassis key picks RS384 for a 2048-bit RSA key and has no RS256.
-        let key = rsa::RsaPrivateKey::from_pkcs8_pem(&sa.private_key)
+        // chassis key picks RS384 for a 2048-bit RSA key and has no RS256. It
+        // signs with ring, not the `rsa` crate, whose private-key operations
+        // are not constant time (RUSTSEC-2023-0071, Marvin; #5).
+        let der = PrivatePkcs8KeyDer::from_pem_slice(sa.private_key.as_bytes())
+            .map_err(|e| format!("gmail service account private_key: {e}"))?;
+        let key = RsaKeyPair::from_pkcs8(der.secret_pkcs8_der())
             .map_err(|e| format!("gmail service account private_key: {e}"))?;
         Ok(Self {
             http: reqwest::Client::new(),
@@ -144,14 +149,15 @@ impl GmailAdapter {
             cfg: cfg.clone(),
             client_email: sa.client_email,
             token_uri: sa.token_uri,
-            key: SigningKey::<Sha256>::new(key),
+            key,
+            rng: SystemRandom::new(),
             token: tokio::sync::Mutex::new(None),
         })
     }
 
     /// The signed JWT-bearer assertion: the service account (`iss`) asking for
     /// a token that acts as the mailbox (`sub`).
-    fn assertion(&self, now: i64) -> String {
+    fn assertion(&self, now: i64) -> Result<String, String> {
         let b64 = |v: serde_json::Value| {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
         };
@@ -165,11 +171,14 @@ impl GmailAdapter {
             "exp": now + ASSERTION_LIFETIME_SECS,
         }));
         let signing_input = format!("{header}.{claims}");
-        let signature = self.key.sign(signing_input.as_bytes()).to_vec();
-        format!(
+        let mut signature = vec![0; self.key.public().modulus_len()];
+        self.key
+            .sign(&RSA_PKCS1_SHA256, &self.rng, signing_input.as_bytes(), &mut signature)
+            .map_err(|e| format!("gmail assertion signing: {e}"))?;
+        Ok(format!(
             "{signing_input}.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
-        )
+        ))
     }
 
     /// A live access token, exchanged for a fresh one when the held one is
@@ -182,11 +191,12 @@ impl GmailAdapter {
                 return Ok(token.clone());
             }
         }
+        let assertion = self.assertion(now)?;
         let resp: TokenResponse = read_json(
             "gmail token exchange",
             self.http.post(&self.token_uri).form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", &self.assertion(now)),
+                ("assertion", &assertion),
             ]),
         )
         .await?;

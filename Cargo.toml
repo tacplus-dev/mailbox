@@ -13,10 +13,13 @@ tracing = "0.1"
 async-trait = "0.1"
 
 # Gmail (src/gmail.rs). reqwest as oauth names it: rustls with the Mozilla roots
-# compiled in, because the runtime image ships no /etc/ssl/certs. rsa signs the
-# RS256 JWT-bearer assertion, which the chassis key cannot (it has no RS256).
+# compiled in, because the runtime image ships no /etc/ssl/certs. ring signs the
+# RS256 JWT-bearer assertion, which the chassis key cannot (it has no RS256): the
+# ring rustls already builds, not the `rsa` crate, whose private-key operations
+# are not constant time (RUSTSEC-2023-0071, #5). pki-types reads the key's PEM.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-webpki-roots", "json"] }
-rsa = { version = "0.9", features = ["sha2"] }
+ring = "0.17"
+rustls-pki-types = { version = "1", features = ["std"] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

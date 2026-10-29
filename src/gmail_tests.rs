@@ -7,10 +7,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
-use rsa::pkcs1v15::{Signature, VerifyingKey};
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::sha2::Sha256;
-use rsa::signature::Verifier;
+use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::PrivatePkcs8KeyDer;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -154,15 +153,12 @@ fn google_accepts(form: &HashMap<String, String>, token_uri: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    let public = rsa::RsaPrivateKey::from_pkcs8_pem(TEST_SA_PEM)
-        .unwrap()
-        .to_public_key();
-    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .ok()
-        .and_then(|s| Signature::try_from(s.as_slice()).ok());
+    let der = PrivatePkcs8KeyDer::from_pem_slice(TEST_SA_PEM.as_bytes()).unwrap();
+    let key = RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()).unwrap();
+    let public = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key().as_ref());
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]).ok();
     let signed = signature.is_some_and(|sig| {
-        VerifyingKey::<Sha256>::new(public)
+        public
             .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
             .is_ok()
     });

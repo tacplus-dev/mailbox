@@ -45,7 +45,7 @@
 // back out of it. That root is gone, along with the sweep that bounded it, per
 // looper/schematic/decisions/kernel-no-durability-user-data-to-stratum-2026-09-25.md
 // item 3 — a mailbox entry is one person's mail, and kernel holds no user data.
-// The `MailboxEntry` record below was already being published; what changed is
+// The `MailboxEntry` record below was already being written; what changed is
 // that it is now also the thing this service READS, over the file-level
 // `(spec.record_read)` paired with the record's own `s2s_read` grant.
 //
@@ -77,13 +77,12 @@ option (spec.record_read) = {record: "mailbox.MailboxEntry"};
 message Config {
   option (spec.grpc_config) = {service_name: "mailbox"};
 
-  // The topic tacplus SYNTHESIZES from MailboxEntry's spec.record
-  // (mailbox.MailboxEntryBus.stream). Same shape as messaging's: no method_s2s
-  // here, because the producer surface is declared on the record itself and the
-  // generator folds it in — restating it could only drift.
-  option (spec.event_publish) = {
-    topic_ref: "mailbox.MailboxEntryBus.stream"
-  };
+  // NO `(spec.event_publish)` on mailbox.MailboxEntryBus.stream, as of
+  // 2026-10-29 (#7). It stood here because publishing a MailboxEntry WAS writing
+  // it: stratum ingested every record topic. Stratum no longer ingests from the
+  // bus (`(spec.record_store) = {no_bus_ingest: true}`, tacplus-dev/stratum#2),
+  // so a row published there would be a row lost. Rows are written through
+  // stratum's generated write surface instead — see MailboxEntry's `s2s_write`.
 
   // The consumer half, and the whole reason this service exists. mailbox is a
   // consumer group of its own on messaging's topic, alongside stratum's; each
@@ -230,18 +229,17 @@ message Secrets {
 //     that lands after the MailboxEntry replay for the same delivery_id would
 //     write a RETRIEVED row back to HELD." The replay index was never built and
 //     is not what replaced kernel state: this service reads the STORE, which is
-//     complete without a replay. The ordering hazard survives in a much narrower
-//     form — a replayed Message whose row was retrieved within the last ingest
-//     hop can still be re-held — and is stated at `on_message` in the service
-//     rather than papered over here.
+//     complete without a replay. The ordering hazard survived in a narrower form
+//     until 2026-10-29 (a replayed Message whose row was retrieved within the
+//     last ingest hop could be re-held); it went with the bus write path, since
+//     a delivery is now held with the store's InsertIfAbsent (#7).
 //
 // READ-YOUR-OWN-WRITE, which is what the state root was really being kept for,
-// is served by the store instead (Jody, 2026-09-27): a write publishes and then
-// point-reads the row back with a short retry, so the caller-facing RPC acks
-// only once stratum's ingest has landed it, and the eventbus hop is
-// milliseconds. If retry-until-visible ever proves insufficient in practice the
-// answer is a synchronous publish-and-read helper in the record plane, generic
-// and built once — not a state root here.
+// is served by the store: since 2026-10-29 (#7) a write goes through stratum's
+// generated write surface, whose answer is final and synchronous, and reads see
+// a write once it is acked. (From 2026-09-27 until then a write was a publish,
+// and the caller-facing RPC point-read its row back until stratum's ingest had
+// landed it.)
 
 // MailboxEntryStatus is the two-state life of an entry. There is no EVICTED
 // state, and that absence is the design: eviction is the record store's memory
@@ -301,14 +299,29 @@ message MailboxEntry {
     owner: "spiffe_id"
 
     // PRODUCER surface: mailbox is the only writer. Nothing else has any
-    // business asserting that a delivery has been retrieved.
+    // business asserting that a delivery has been retrieved. A record is still
+    // an event in tacplus 2.5 and must declare one, but mailbox no longer
+    // publishes on it (see Config): its writes go through `s2s_write` below.
     s2s: {auth_services: ["mailbox"]}
 
-    // CONSUMER surface: stratum, the record store, and nobody else. See the
-    // correction at the top of this file — the doc's `["mailbox"]` would have
-    // denied the store on the topic it auto-subscribes to, leaving the record
-    // unstored and `residency` below with no rows to govern.
+    // CONSUMER surface: stratum, and nobody else. Since tacplus 2.5 this is
+    // also the audience of the store's `WatchMailboxEntryChanges`, the record's
+    // change feed that replaces the topic; no service watches it today.
     s2s_subscribe: {auth_services: ["stratum"]}
+
+    // STORE WRITE: mailbox writes its rows through stratum's generated write
+    // surface (`InsertIfAbsentMailboxEntry`, `ReplaceIfUnchangedMailboxEntry`),
+    // whose answer is final: done, or refused with the reason. This replaced
+    // publishing on the topic on 2026-10-29 (#7), when stratum stopped ingesting
+    // from the bus (tacplus-dev/stratum#2).
+    s2s_write: {auth_services: ["mailbox"]}
+
+    // LOCAL, the default, stated: a write is acked once the local redo has it on
+    // disk, so it survives a full restart and a zone loss. A mailbox entry is
+    // one person's mail and must survive a restart (MEMORY would not). REMOTE is
+    // for rows that must never be lost even to a region loss; what a region
+    // loss costs here is the last few retrievals, i.e. mail shown again.
+    durability: DURABILITY_LOCAL
 
     // STORED-ROW READ: mailbox reads its own rows back. Paired with the
     // file-level `(spec.record_read)` at the top of this file, and a SEPARATE
@@ -457,8 +470,8 @@ message MailboxEntry {
   reserved 10;
   reserved "ejectionable";
 
-  // store_epoch_ms is the row's LAST WRITE, stamped by the generated wrapper
-  // and never by this service. It is the record's durable write clock: what the
+  // store_epoch_ms is the row's LAST WRITE, stamped on the store's side and
+  // never by this service. It is the record's durable write clock: what the
   // disk leg ranges on, and what `residency.deleted_max_age_seconds` would
   // measure a delete from if this type had a (spec.deleted_flag). The memory
   // idle clock also counts READS, which no field can see — which is precisely
@@ -475,8 +488,10 @@ message MailboxEntry {
   // topic discovery matches the literal field name "spiffe_id" of string type
   // when deciding which topics get publisher-identity stamping.
   //
-  // It holds MAILBOX'S OWN service identity — this service is the publisher.
-  // `recipient` above is where the person is.
+  // It holds MAILBOX'S OWN service identity — this service is the writer.
+  // `recipient` above is where the person is. Eventbus stamped it while rows
+  // were published; since rows go through stratum's write surface (#7), this
+  // service still leaves it empty for the store's side to stamp.
   string spiffe_id = 12 [
     (spec.identity_spiffe_subject) = true,
     (spec.assert_max_size) = 1024,

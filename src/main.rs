@@ -48,26 +48,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // that makes this service a consumer group, and blocks until shutdown.
     let sm = Arc::new(ServiceManager::new().await?);
 
-    // The record topic is SYNTHESIZED from MailboxEntry's spec.record, so its
-    // publisher factory is named after the generated wrapper (MailboxEntryBus)
-    // and its field (stream), not after anything hand-written. Acquired before
-    // the server starts rather than lazily, because it is on the path of the
-    // very first message the subscription delivers.
+    // The whole of "wire up storage": the ServiceManager owns stratum's record
+    // plane client, generated because mailbox.proto declares (spec.record_read)
+    // over MailboxEntry, and MailboxEntry grants this service its reads
+    // (s2s_read) and writes (s2s_write). Rows are written through that client
+    // and not published on the record's topic: stratum no longer ingests from
+    // the bus (#7). There is no state client either — mailbox has no kernel
+    // state root.
     //
-    // Note what is NOT here: no eventbus client is constructed, no topic name is
-    // typed out, no token is acquired for the "eventbus" audience, and — for the
-    // CONSUMER half — no consumer group is named either. The group is the
-    // service label and the subscription is started by sm.run() from the
-    // (spec.event_watch) declaration in the proto.
-    let publish = sm.create_mailbox_mailbox_entry_bus_stream_publisher().await;
+    // Note what is NOT here for the CONSUMER half: no eventbus client, no topic
+    // name, no consumer group. The group is the service label and the
+    // subscription is started by sm.run() from the (spec.event_watch)
+    // declaration in the proto.
+    let rows = Arc::new(service::RecordPlaneStore(sm.clone()));
 
-    // The READ half, and the whole of "wire up storage" since 2026-09-27: the
-    // ServiceManager owns the record plane's client, generated because
-    // mailbox.proto declares (spec.record_read) over MailboxEntry. There is no
-    // state client here any more — mailbox has no kernel state root.
-    let rows = Arc::new(service::RecordPlaneRows(sm.clone()));
-
-    let svc = Arc::new(service::MailboxService::new(rows, publish));
+    let svc = Arc::new(service::MailboxService::new(rows));
     let handler = Arc::new(service::MailboxServiceHandler::new(svc));
 
     // No sweep task. The timer that used to run here pruned MailboxState in

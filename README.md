@@ -25,12 +25,18 @@ There is no sweep any more, and no kernel state for it to sweep. `MailboxState`
 was removed on 2026-09-27 per
 `looper/schematic/decisions/kernel-no-durability-user-data-to-stratum-2026-09-25.md`
 item 3: a mailbox entry is one person's mail, and kernel holds no user data. Rows
-live in stratum only — written by publishing onto the record's topic, read back
-through the generated reader that the file-level `(spec.record_read)` pairs with
-`MailboxEntry`'s own `s2s_read` grant, the same pairing `letsencrypt` uses for its
-certificate. `UpdateHeldMail` point-reads its own write back before answering, so
-the `ListHeldMail` a client issues next is correct without a kernel copy behind
-it.
+live in stratum only — written through stratum's generated write surface
+(`InsertIfAbsentMailboxEntry` to hold a delivery, `ReplaceIfUnchangedMailboxEntry`
+to retrieve it, granted by `MailboxEntry`'s `s2s_write` and acked at its declared
+`LOCAL` durability), read back through `GetMailboxEntry` and the generated reader
+that the file-level `(spec.record_read)` pairs with `MailboxEntry`'s own
+`s2s_read` grant, the same pairing `letsencrypt` uses for its certificate.
+Rows are no longer published on the record's topic: stratum stopped ingesting
+from the event bus (tacplus-dev/stratum#2, mailbox #7). A write's answer is
+final, so the `ListHeldMail` a client issues after `UpdateHeldMail` is correct
+without a kernel copy behind it; while stratum's redo is unreachable a write is
+refused (UNAVAILABLE), `UpdateHeldMail` answers that, and a delivery is not
+acknowledged, so it is delivered again.
 
 One consequence, called out because nothing else in the tree says it: the 90-day
 `held_since_ms` expiry went with the state root it bounded, and no record-side

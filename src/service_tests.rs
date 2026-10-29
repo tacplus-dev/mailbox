@@ -10,28 +10,28 @@
 //!     rendered into that wrapper and NOWHERE else, so a test that called the
 //!     handler trait directly would quietly be asserting that this service
 //!     re-implements them — which it deliberately does not.
-//!   - The store is a FAKE STRATUM behind the `MailboxEntryRows` seam, fed by the
-//!     publisher: publishing a row "ingests" it, after a configurable lag, and
-//!     only then does a read see it. That is the record pipeline's actual shape —
-//!     a publish, an asynchronous ingest, a read — so the read-after-write the
-//!     handler performs is exercised rather than assumed.
+//!   - The store is a FAKE STRATUM behind the `MailboxEntryStore` seam, answering
+//!     the way stratum's generated write surface does (tacplus 2.5): a write is
+//!     final and synchronous, done with a new revision or refused with the
+//!     reason — ALREADY_EXISTS, ABORTED, NOT_FOUND, and UNAVAILABLE while its
+//!     redo is unreachable. An acked write is readable at once and lands on the
+//!     record's change feed, the tail `WatchMailboxEntryChanges` serves; a
+//!     refused one does neither.
 //!   - The consumer-group path goes in through `on_message` with a `RecordMeta`,
 //!     which is what the generated subscriber hands the handler.
 //!
-//! WHY THE STORE IS A FAKE AND NOT THE GENERATED READER, since the previous shape
-//! of this file DID stand up the generated `MailboxStateClient` over an
-//! in-process server: the record plane's server trait (`query::RecordMap`) is 112
-//! methods and 28 stream types, because it covers every `(spec.record)` in the
-//! fleet. A fixture implementing it is not a fixture. So `RecordPlaneRows` — the
-//! four lines that forward to the generated `MailboxEntryRecordReader` — is the
-//! one part of the read path these tests do not cover, exactly as letsencrypt's
-//! `recordStore` is the part its `certRecordStore` fake does not cover.
+//! WHY THE STORE IS A FAKE AND NOT THE GENERATED CLIENT: the record plane's
+//! server trait (`query::RecordMap`) covers every `(spec.record)` in the fleet,
+//! its query plane and now its write surface, and a fixture implementing it is
+//! not a fixture. So `RecordPlaneStore` — the lines that forward to the
+//! generated `RecordMapGrpcClient` and reader — is the one part of the store
+//! path these tests do not cover, exactly as letsencrypt's `recordStore` is the
+//! part its `certRecordStore` fake does not cover.
 //!
-//! WHAT THESE DO NOT PROVE. That a broker accepted a publish, or anything about
-//! the record store's residency clock: `(spec.record).residency` is a declaration
-//! the store acts on, with no runtime surface in this service to drive or
-//! observe. There are no sweep tests any more either — the state root the sweep
-//! pruned went away on 2026-09-27 and nothing replaced it.
+//! WHAT THESE DO NOT PROVE. That stratum and its redo answer as the fake does
+//! (stratum's own tests hold that), or anything about the record store's
+//! residency clock: `(spec.record).residency` is a declaration the store acts
+//! on, with no runtime surface in this service to drive or observe.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,10 +45,11 @@ use mailbox_model::types::services::mailbox::mailbox_server::Mailbox;
 use mailbox_model::types::services::mailbox::*;
 use mailbox_model::types::services::messaging::Message;
 use mailbox_model::types::sys::accounting::accounting::Event;
-use mailbox_model::types::vservices::query::MailboxEntryFilter;
-use tokio::time::Instant;
+use mailbox_model::types::vservices::query::{
+    MailboxEntryFilter, MailboxEntryWatchChange, RecordChangeType,
+};
 
-use crate::service::{MailboxEntryRows, MailboxService};
+use crate::service::{MailboxEntryStore, MailboxService};
 
 /// The tenant every fixture token carries. Nothing asserts on the literal except
 /// the namespace tests, which need a SECOND value to disagree with it.
@@ -62,58 +63,85 @@ const BOB: &str = "user:bob";
 // The fake stratum
 // ---------------------------------------------------------------------------
 
-/// One record's rows, with the ingest lag that makes this a record store rather
-/// than a map.
+/// One record type's rows, answering as stratum's generated write surface does.
 ///
-/// `ingest` is what the harness's publisher calls — publishing IS writing, so the
-/// fake's only writer is the topic. A row becomes readable `lag` after it is
-/// published, which is the window `MailboxService::publish_and_confirm` exists to
-/// close. `lag` defaults to zero so every test that is not about visibility reads
-/// what it just wrote.
+/// Every acked write gets the next revision and goes onto `feed`, the change
+/// feed `WatchMailboxEntryChanges` serves; a refused write changes nothing and
+/// is on no feed. `refuse_writes` stands in for the redo service being
+/// unreachable (UNAVAILABLE) or for a durability level not yet served
+/// (FAILED_PRECONDITION): reads still answer, because the rows are in memory,
+/// and every write is refused with that code.
 #[derive(Default)]
 struct FakeStratum {
-    /// delivery_id -> (row, the moment it becomes readable).
-    rows: Mutex<HashMap<String, (MailboxEntry, Option<Instant>)>>,
-    lag: Mutex<Duration>,
+    /// delivery_id -> (row, revision).
+    rows: Mutex<HashMap<String, (MailboxEntry, i64)>>,
+    revision: Mutex<i64>,
+    feed: Mutex<Vec<MailboxEntryWatchChange>>,
+    refuse_writes: Mutex<Option<tonic::Code>>,
+    /// Writes another writer lands just before this service's next
+    /// `replace_if_unchanged`, so that one finds the entry changed underneath.
+    interleaved: Mutex<Vec<MailboxEntry>>,
 }
 
 impl FakeStratum {
-    fn set_lag(&self, lag: Duration) {
-        *self.lag.lock().unwrap() = lag;
+    fn refuse_writes(&self, code: Option<tonic::Code>) {
+        *self.refuse_writes.lock().unwrap() = code;
     }
 
-    /// stratum's side of a publish.
-    fn ingest(&self, entry: MailboxEntry) {
-        let lag = *self.lag.lock().unwrap();
-        let visible_at = if lag.is_zero() {
-            None
-        } else {
-            Some(Instant::now() + lag)
-        };
+    fn interleave(&self, entry: MailboxEntry) {
+        self.interleaved.lock().unwrap().push(entry);
+    }
+
+    fn refusal(&self) -> Result<(), tonic::Status> {
+        match *self.refuse_writes.lock().unwrap() {
+            Some(code) => Err(tonic::Status::new(code, "fake stratum: write refused")),
+            None => Ok(()),
+        }
+    }
+
+    /// Apply an acked write: the next revision, the row, and the feed.
+    fn commit(&self, entry: MailboxEntry, change: RecordChangeType) -> i64 {
+        let mut revision = self.revision.lock().unwrap();
+        *revision += 1;
         self.rows
             .lock()
             .unwrap()
-            .insert(entry.delivery_id.clone(), (entry, visible_at));
+            .insert(entry.delivery_id.clone(), (entry.clone(), *revision));
+        self.feed.lock().unwrap().push(MailboxEntryWatchChange {
+            r#type: change as i32,
+            item: Some(entry),
+            revision: *revision,
+            ..Default::default()
+        });
+        *revision
     }
 
-    /// Every readable row, in key order — the order a store with an indexed key
-    /// would page in, so `list` below can page deterministically.
-    fn visible(&self) -> Vec<MailboxEntry> {
-        let now = Instant::now();
+    /// The changes `WatchMailboxEntryChanges{from_revision}` delivers after
+    /// `from_revision`, in order.
+    fn watch(&self, from_revision: i64) -> Vec<MailboxEntryWatchChange> {
+        self.feed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.revision > from_revision)
+            .cloned()
+            .collect()
+    }
+
+    /// Every row, in key order — the order a store with an indexed key would
+    /// page in, so `list` below can page deterministically.
+    fn all(&self) -> Vec<MailboxEntry> {
         let mut rows: Vec<MailboxEntry> = self
             .rows
             .lock()
             .unwrap()
             .values()
-            .filter(|(_, visible_at)| visible_at.map_or(true, |t| now >= t))
             .map(|(row, _)| row.clone())
             .collect();
         rows.sort_by(|a, b| a.delivery_id.cmp(&b.delivery_id));
         rows
     }
 
-    /// One row whether or not it is readable yet — for assertions about what was
-    /// WRITTEN, which is not the same question as what a caller can see.
     fn stored(&self, delivery_id: &str) -> Option<MailboxEntry> {
         self.rows
             .lock()
@@ -124,12 +152,20 @@ impl FakeStratum {
 }
 
 #[async_trait::async_trait]
-impl MailboxEntryRows for FakeStratum {
-    async fn get(&self, delivery_id: &str) -> Result<Option<MailboxEntry>, tonic::Status> {
+impl MailboxEntryStore for FakeStratum {
+    /// `Get<T>` answers a key only for an entry in the named tenant.
+    async fn get(
+        &self,
+        delivery_id: &str,
+        namespace: &str,
+    ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status> {
         Ok(self
-            .visible()
-            .into_iter()
-            .find(|r| r.delivery_id == delivery_id))
+            .rows
+            .lock()
+            .unwrap()
+            .get(delivery_id)
+            .filter(|(row, _)| row.namespace == namespace)
+            .cloned())
     }
 
     /// The criteria this fake honours are the ones `MailboxEntryFilter` carries
@@ -143,7 +179,7 @@ impl MailboxEntryRows for FakeStratum {
         page_token: String,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
         let matching: Vec<MailboxEntry> = self
-            .visible()
+            .all()
             .into_iter()
             .filter(|r| {
                 filter
@@ -160,6 +196,38 @@ impl MailboxEntryRows for FakeStratum {
             String::new()
         };
         Ok((page, next))
+    }
+
+    async fn insert_if_absent(&self, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+        self.refusal()?;
+        if self.rows.lock().unwrap().contains_key(&entry.delivery_id) {
+            return Err(tonic::Status::already_exists("fake stratum: entry exists"));
+        }
+        Ok(self.commit(entry, RecordChangeType::Add))
+    }
+
+    async fn replace_if_unchanged(
+        &self,
+        entry: MailboxEntry,
+        expected_revision: i64,
+    ) -> Result<i64, tonic::Status> {
+        self.refusal()?;
+        for other in std::mem::take(&mut *self.interleaved.lock().unwrap()) {
+            self.commit(other, RecordChangeType::Modify);
+        }
+        let current = self
+            .rows
+            .lock()
+            .unwrap()
+            .get(&entry.delivery_id)
+            .map(|(_, revision)| *revision);
+        match current {
+            None => Err(tonic::Status::not_found("fake stratum: no such entry")),
+            Some(r) if r != expected_revision => {
+                Err(tonic::Status::aborted("fake stratum: changed underneath"))
+            }
+            Some(_) => Ok(self.commit(entry, RecordChangeType::Modify)),
+        }
     }
 }
 
@@ -206,6 +274,7 @@ impl Authorizer for TokenAuthorizer {
 
     async fn check_at_or_below(
         &self,
+        _full_method: &str,
         authorization: Option<&str>,
         _target_namespace: &str,
     ) -> Result<HashMap<String, String>, tonic::Status> {
@@ -218,6 +287,7 @@ impl Authorizer for TokenAuthorizer {
     // differ only in the checks a REAL authorizer layers on top of that.
     async fn authenticate(
         &self,
+        _full_method: &str,
         authorization: Option<&str>,
     ) -> Result<HashMap<String, String>, tonic::Status> {
         Self::identity(authorization)
@@ -245,32 +315,15 @@ struct Harness {
     /// an RPC) and through the wrapper for the RPCs.
     svc: Arc<MailboxService>,
     wrapper: ValidationWrapper,
-    /// Every `MailboxEntry` the service published, in order — the record-side
-    /// evidence of what was written, and in what sequence.
-    published: Arc<Mutex<Vec<MailboxEntry>>>,
-    /// The store the publisher feeds, so a test can read the rows the service
-    /// wrote — the only way to assert on a field no response carries.
+    /// The store the service writes through, so a test can read the rows and
+    /// the change feed — the only way to assert on a field no response carries.
     stratum: Arc<FakeStratum>,
 }
 
 impl Harness {
     async fn start() -> Harness {
         let stratum = Arc::new(FakeStratum::default());
-        let published: Arc<Mutex<Vec<MailboxEntry>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // The publisher IS the write path, so the fixture's publisher is what
-        // feeds the store — a test cannot write a row the service did not
-        // publish, which is the property the old two-store fixture could not have.
-        let sink = published.clone();
-        let ingest = stratum.clone();
-        let svc = Arc::new(MailboxService::new(
-            stratum.clone(),
-            Arc::new(move |e: MailboxEntry| {
-                sink.lock().unwrap().push(e.clone());
-                ingest.ingest(e);
-                Ok(())
-            }),
-        ));
+        let svc = Arc::new(MailboxService::new(stratum.clone()));
 
         // The generated seam, wired the way the ServiceManager wires it at
         // startup: an authorizer (mandatory — the wrapper fails closed without
@@ -291,7 +344,6 @@ impl Harness {
         Harness {
             svc,
             wrapper,
-            published,
             stratum,
         }
     }
@@ -331,8 +383,9 @@ impl Harness {
         tonic::Request::new(req)
     }
 
-    fn published(&self) -> Vec<MailboxEntry> {
-        self.published.lock().unwrap().clone()
+    /// Every change the store's Watch delivers from the start.
+    fn watched(&self) -> Vec<MailboxEntryWatchChange> {
+        self.stratum.watch(0)
     }
 
     fn row(&self, delivery_id: &str) -> Option<MailboxEntry> {
@@ -340,7 +393,7 @@ impl Harness {
     }
 
     fn rows(&self) -> Vec<MailboxEntry> {
-        self.stratum.visible()
+        self.stratum.all()
     }
 
     /// Deliver one message on the consumer group, as the generated subscriber
@@ -429,24 +482,25 @@ async fn a_delivery_becomes_a_held_entry_on_the_same_key() {
     assert_eq!(row.subject, "standup");
     assert_eq!(row.sent_at_ms, 1_700_000_000_000);
 
-    // The record went to the topic too — the store's copy.
-    assert_eq!(h.published().len(), 1);
-    assert_eq!(h.published()[0].delivery_id, row.delivery_id);
+    // Written through the store, and so delivered by its Watch: one ADD, the
+    // row as stored.
+    let watched = h.watched();
+    assert_eq!(watched.len(), 1);
+    assert_eq!(watched[0].r#type, RecordChangeType::Add as i32);
+    assert_eq!(watched[0].item.as_ref(), Some(&row));
 }
 
-/// The service stamps NO identity and NO store epoch. Both are stamped for it —
-/// `spiffe_id` by eventbus at publish, `store_epoch_ms` by the generated
-/// wrapper — and a value written here would be a claim nothing verified.
+/// The service stamps NO identity and NO store epoch. Both are the store's to
+/// stamp, and a value written here would be a claim nothing verified.
 #[tokio::test]
 async fn the_service_stamps_no_identity_and_no_store_epoch() {
     let h = Harness::start().await;
     h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
         .await;
 
-    let published = h.published();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].spiffe_id, "");
-    assert_eq!(published[0].store_epoch_ms, 0);
+    let written = h.row(&format!("m1/{ALICE}")).unwrap();
+    assert_eq!(written.spiffe_id, "");
+    assert_eq!(written.store_epoch_ms, 0);
 }
 
 /// REPLAY IS A NO-OP. `earliest` means the whole topic is re-delivered on every
@@ -462,9 +516,9 @@ async fn a_replayed_delivery_writes_nothing_new() {
 
     assert_eq!(h.rows().len(), 1, "one delivery is one row, however often it is replayed");
     assert_eq!(
-        h.published().len(),
+        h.watched().len(),
         1,
-        "a replay must not republish; the store's copy is already correct"
+        "a replay must not rewrite; the store's copy is already correct"
     );
 }
 
@@ -508,7 +562,37 @@ async fn a_delivery_with_no_key_is_dropped_not_retried() {
     msg.delivery_id = String::new();
     h.deliver(msg, 1_700_000_100_000).await;
     assert!(h.rows().is_empty());
-    assert!(h.published().is_empty());
+    assert!(h.watched().is_empty());
+}
+
+/// While stratum's redo is unreachable it refuses every write, and the delivery
+/// is NOT acknowledged: the error goes back to the subscriber, which redelivers
+/// it. A delivery acked without its row would be mail nobody is ever told about.
+#[tokio::test]
+async fn a_delivery_refused_while_redo_is_unreachable_is_redelivered() {
+    let h = Harness::start().await;
+    h.stratum.refuse_writes(Some(tonic::Code::Unavailable));
+
+    let err = h
+        .svc
+        .on_message(delivery("m1", ALICE, TENANT), &meta_at(1_700_000_100_000))
+        .await
+        .expect_err("a refused write must not acknowledge the delivery");
+    let status = err
+        .downcast_ref::<tonic::Status>()
+        .expect("the store's refusal, as it answered");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(h.rows().is_empty());
+    assert!(h.watched().is_empty(), "a refused write is on no change feed");
+
+    // The redelivery, once the redo is back, holds it.
+    h.stratum.refuse_writes(None);
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    assert_eq!(
+        h.row(&format!("m1/{ALICE}")).unwrap().status,
+        MailboxEntryStatus::Held as i32
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -632,13 +716,13 @@ async fn update_held_mail_marks_retrieved_and_stamps_the_clock() {
     assert_eq!(row.status, MailboxEntryStatus::Retrieved as i32);
     assert_eq!(row.retrieved_at_ms, resp.retrieved_at_ms);
 
-    // The retrieval republished the row: the store's copy has to learn the new
-    // status too.
-    assert_eq!(h.published().len(), 2);
-    assert_eq!(
-        h.published()[1].status,
-        MailboxEntryStatus::Retrieved as i32
-    );
+    // The retrieval replaced the row in the store, and Watch delivers it after
+    // the ADD that held it.
+    let watched = h.watched();
+    assert_eq!(watched.len(), 2);
+    assert_eq!(watched[1].r#type, RecordChangeType::Modify as i32);
+    assert!(watched[1].revision > watched[0].revision);
+    assert_eq!(watched[1].item.as_ref(), Some(&row));
 }
 
 /// IDEMPOTENT: a second call is a no-op, returns the id as NOT newly retrieved,
@@ -985,67 +1069,17 @@ async fn a_row_from_another_tenant_is_not_retrievable() {
 }
 
 // ---------------------------------------------------------------------------
-// Read-after-write — what replaced the state root
+// The store's answers — final and synchronous
 // ---------------------------------------------------------------------------
 
-/// A retrieval does not answer until the store will hand the row back.
-///
-/// THE POINT OF THE WHOLE MIGRATION, and the one thing kernel state used to give
-/// for free. The store here takes 200ms to ingest; the handler must not return
-/// before then, because the client's very next `ListHeldMail` would otherwise
-/// still see the row as HELD and hand it the same mail again.
-#[tokio::test(start_paused = true)]
-async fn a_retrieval_waits_for_the_store_to_make_it_visible() {
+/// While stratum's redo is unreachable a retrieval is REFUSED, and the caller is
+/// told so: the mail is still held, and the next `ListHeldMail` says so.
+#[tokio::test]
+async fn a_retrieval_is_refused_while_redo_is_unreachable() {
     let h = Harness::start().await;
     h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
         .await;
-    h.stratum.set_lag(Duration::from_millis(200));
-    let id = format!("m1/{ALICE}");
-
-    let started = Instant::now();
-    h.wrapper
-        .update_held_mail(Harness::signed(
-            UpdateHeldMailRequest {
-                delivery_ids: vec![id.clone()],
-                ..Default::default()
-            },
-            ALICE,
-            TENANT,
-        ))
-        .await
-        .expect("retrieve");
-
-    assert!(
-        started.elapsed() >= Duration::from_millis(200),
-        "the rpc returned before its own write was readable"
-    );
-
-    // And the read that follows it is correct, which is what the wait buys.
-    let resp = h
-        .wrapper
-        .list_held_mail(Harness::signed(
-            ListHeldMailRequest::default(),
-            ALICE,
-            TENANT,
-        ))
-        .await
-        .expect("list")
-        .into_inner();
-    assert!(resp.entries.is_empty());
-}
-
-/// A store that never makes the write readable is a FAILED SAVE, not a success.
-///
-/// Reported rather than swallowed: the publish will still land, but a client told
-/// "retrieved" and then handed the same mail again is the outcome the wait exists
-/// to prevent, so exceeding the bound has to be visible to the caller.
-#[tokio::test(start_paused = true)]
-async fn a_retrieval_that_never_becomes_visible_fails() {
-    let h = Harness::start().await;
-    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
-        .await;
-    // Far beyond VISIBILITY_TIMEOUT. Paused time makes this instant.
-    h.stratum.set_lag(Duration::from_secs(600));
+    h.stratum.refuse_writes(Some(tonic::Code::Unavailable));
 
     let err = h
         .wrapper
@@ -1058,30 +1092,116 @@ async fn a_retrieval_that_never_becomes_visible_fails() {
             TENANT,
         ))
         .await
-        .expect_err("an unreadable write must not be reported as saved");
-    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+        .expect_err("a refused write must not be reported as saved");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+    assert_eq!(h.watched().len(), 1, "only the ADD that held it");
 
-    // The row WAS published — the publish is not undone by the wait failing, and
-    // saying otherwise would be a lie about what the service did.
+    // Reads still answer: the rows are in stratum's memory.
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+    assert_eq!(resp.entries.len(), 1);
+}
+
+/// A durability level the store cannot serve yet (REMOTE, until
+/// tacplus-dev/redo#1 step 2) is refused with FAILED_PRECONDITION, and that is
+/// what the caller gets — never a retrieval reported as done.
+#[tokio::test]
+async fn a_refusal_for_an_unserved_durability_reaches_the_caller() {
+    let h = Harness::start().await;
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    h.stratum
+        .refuse_writes(Some(tonic::Code::FailedPrecondition));
+
+    let err = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![format!("m1/{ALICE}")],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect_err("a refused write must not be reported as saved");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         h.row(&format!("m1/{ALICE}")).unwrap().status,
-        MailboxEntryStatus::Retrieved as i32
+        MailboxEntryStatus::Held as i32
     );
 }
 
-/// The consume path does NOT wait. A delivery per ingest round trip would put
-/// that latency in front of every message of every replay, and nothing reads
-/// these rows back in the same breath.
-#[tokio::test(start_paused = true)]
-async fn the_consume_path_does_not_wait_for_ingest() {
+/// Two retrievals of one delivery race: the other one lands first, so this
+/// one's replace is ABORTED. It reads the row again, finds it retrieved, and
+/// leaves it — the FIRST retrieval's timestamp stands, and it is no error.
+#[tokio::test]
+async fn a_retrieval_that_loses_a_race_leaves_the_winner_standing() {
     let h = Harness::start().await;
-    h.stratum.set_lag(Duration::from_secs(600));
-
-    let started = Instant::now();
     h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
         .await;
-    assert!(started.elapsed() < Duration::from_millis(50));
-    assert_eq!(h.published().len(), 1);
+    let id = format!("m1/{ALICE}");
+    let mut winner = h.row(&id).unwrap();
+    winner.status = MailboxEntryStatus::Retrieved as i32;
+    winner.retrieved_at_ms = 1_700_000_500_000;
+    h.stratum.interleave(winner);
+
+    let resp = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("losing a race is not an error")
+        .into_inner();
+
+    assert!(resp.retrieved_delivery_ids.is_empty());
+    assert_eq!(h.row(&id).unwrap().retrieved_at_ms, 1_700_000_500_000);
+}
+
+/// An entry changed underneath in a way that leaves it HELD: the replace is
+/// ABORTED, and the retrieval is made again on the row as it now stands.
+#[tokio::test]
+async fn a_retrieval_changed_underneath_is_retried_on_the_new_row() {
+    let h = Harness::start().await;
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    let id = format!("m1/{ALICE}");
+    let mut other = h.row(&id).unwrap();
+    other.subject = "standup, moved".to_string();
+    h.stratum.interleave(other);
+
+    let resp = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("retrieve")
+        .into_inner();
+
+    assert_eq!(resp.retrieved_delivery_ids, vec![id.clone()]);
+    let row = h.row(&id).unwrap();
+    assert_eq!(row.status, MailboxEntryStatus::Retrieved as i32);
+    assert_eq!(row.subject, "standup, moved", "the other write is not undone");
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,7 +1267,7 @@ async fn config_is_applied_and_both_fields_are_inert() {
     // Nothing observable changed: no timer to retime, and no row touched.
     h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
         .await;
-    assert_eq!(h.published().len(), 1);
+    assert_eq!(h.watched().len(), 1);
 }
 
 /// Gmail on without its key is refused, and the refusal names the env var the

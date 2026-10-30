@@ -70,6 +70,11 @@ use mailbox_model::types::vservices::query::{
 ///
 /// Nothing wider than what this service asks: this row, the rows for this
 /// recipient, hold this delivery, retrieve this row.
+///
+/// Every method names `tenant`, the tid of the per-tenant Stratum the call is
+/// routed to (tacplus 2.5.3, `target_tenant`). It is always the tenant OF THE
+/// ROW — see [`tenant_of`] — and never this service's own: mailbox holds every
+/// tenant's mail, and a tenant-owned Stratum refuses a row outside its tenant.
 #[async_trait::async_trait]
 pub trait MailboxEntryStore: Send + Sync {
     /// One row of the tenant `namespace` by record key, with its revision, or
@@ -78,29 +83,45 @@ pub trait MailboxEntryStore: Send + Sync {
     /// callers below.
     async fn get(
         &self,
+        tenant: &str,
         delivery_id: &str,
         namespace: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status>;
 
-    /// One page of rows matching `filter`, with the next page token (empty on the
-    /// last page).
+    /// One page of `tenant`'s rows matching `filter`, with the next page token
+    /// (empty on the last page).
     async fn list(
         &self,
+        tenant: &str,
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status>;
 
     /// Write `entry` unless its key exists: its revision, or ALREADY_EXISTS.
-    async fn insert_if_absent(&self, entry: MailboxEntry) -> Result<i64, tonic::Status>;
+    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status>;
 
     /// Replace the row `entry` keys if it is still at `expected_revision`: the
     /// new revision, ABORTED when it changed underneath, NOT_FOUND when absent.
     async fn replace_if_unchanged(
         &self,
+        tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
     ) -> Result<i64, tonic::Status>;
+}
+
+/// The tid of the tenant whose Stratum holds the rows of `namespace`: the
+/// `<tid>` of `/tenants/<tid>` or of anything below it, or `None` for a
+/// namespace in no tenant (`/system`, say). The chassis's own reading of a
+/// namespace claim, so this service cannot disagree with the router about it.
+///
+/// Every record-plane call is routed by the tenant the RECORD names (roadmap
+/// decisions/tenant-routing-2026-10-26.md: the request names its tenant): the
+/// delivery's namespace on the way in, the caller's verified namespace (which a
+/// row must equal to be theirs) on the way out.
+pub fn tenant_of(namespace: &str) -> Option<String> {
+    servicemanager::tenant_route::tenant_of_caller_namespace(namespace)
 }
 
 /// The production store: stratum's record plane, through the generated client.
@@ -122,6 +143,7 @@ impl RecordPlaneStore {
 impl MailboxEntryStore for RecordPlaneStore {
     async fn get(
         &self,
+        tenant: &str,
         delivery_id: &str,
         namespace: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status> {
@@ -130,6 +152,7 @@ impl MailboxEntryStore for RecordPlaneStore {
             .get_mailbox_entry(GetMailboxEntryRequest {
                 delivery_id: delivery_id.to_string(),
                 namespace: namespace.to_string(),
+                target_tenant: tenant.to_string(),
                 ..Default::default()
             })
             .await;
@@ -145,6 +168,7 @@ impl MailboxEntryStore for RecordPlaneStore {
 
     async fn list(
         &self,
+        tenant: &str,
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
@@ -152,16 +176,17 @@ impl MailboxEntryStore for RecordPlaneStore {
         let (rows, next, _total) = self
             .0
             .mailbox_entry_record_reader()
-            .list(Some(filter), page_size, page_token)
+            .list(tenant, Some(filter), page_size, page_token)
             .await?;
         Ok((rows, next))
     }
 
-    async fn insert_if_absent(&self, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status> {
         Ok(self
             .client()
             .insert_if_absent_mailbox_entry(InsertIfAbsentMailboxEntryRequest {
                 item: Some(entry),
+                target_tenant: tenant.to_string(),
                 ..Default::default()
             })
             .await?
@@ -171,6 +196,7 @@ impl MailboxEntryStore for RecordPlaneStore {
 
     async fn replace_if_unchanged(
         &self,
+        tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
     ) -> Result<i64, tonic::Status> {
@@ -181,6 +207,7 @@ impl MailboxEntryStore for RecordPlaneStore {
                 expected: Some(replace_if_unchanged_mailbox_entry_request::Expected::ExpectedRevision(
                     expected_revision,
                 )),
+                target_tenant: tenant.to_string(),
                 ..Default::default()
             })
             .await?
@@ -275,6 +302,7 @@ impl MailboxService {
     /// otherwise.
     async fn retrieve(
         &self,
+        tenant: &str,
         delivery_id: &str,
         recipient: &str,
         namespace: &str,
@@ -283,7 +311,7 @@ impl MailboxService {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let Some((entry, revision)) = self.rows.get(delivery_id, namespace).await? else {
+            let Some((entry, revision)) = self.rows.get(tenant, delivery_id, namespace).await? else {
                 // An id naming no row is absent from the response, not an error.
                 return Ok(false);
             };
@@ -305,7 +333,7 @@ impl MailboxService {
             let mut updated = entry;
             updated.status = MailboxEntryStatus::Retrieved as i32;
             updated.retrieved_at_ms = now;
-            match self.rows.replace_if_unchanged(updated, revision).await {
+            match self.rows.replace_if_unchanged(tenant, updated, revision).await {
                 Ok(_) => return Ok(true),
                 Err(status) if status.code() == tonic::Code::NotFound => return Ok(false),
                 Err(status)
@@ -318,14 +346,19 @@ impl MailboxService {
         }
     }
 
-    /// Every row the store holds for one recipient, up to the page cap.
+    /// Every row `tenant`'s store holds for one recipient, up to the page cap.
     ///
-    /// The tenant is NOT part of the predicate: `namespace` on this record is
-    /// deliberately not a `(spec.query_field)` (it exists to BE the egress
-    /// boundary), and the record plane's S2S half leaves a `/system` peer's read
-    /// unpinned — fleet-wide — so the caller's verified tenant is compared here,
-    /// on rows, by the callers of this method.
-    async fn rows_for_recipient(&self, recipient: &str) -> Result<Vec<MailboxEntry>, tonic::Status> {
+    /// The call is routed to the caller's tenant, so it reads that tenant's
+    /// Stratum and no other. `namespace` is still NOT part of the predicate: it
+    /// is deliberately not a `(spec.query_field)` (it exists to BE the egress
+    /// boundary), and one tenant's store holds every namespace below it, so the
+    /// caller's verified namespace is compared here, on rows, by the callers of
+    /// this method.
+    async fn rows_for_recipient(
+        &self,
+        tenant: &str,
+        recipient: &str,
+    ) -> Result<Vec<MailboxEntry>, tonic::Status> {
         let mut rows = Vec::new();
         let mut page_token = String::new();
         for _ in 0..MAX_SCAN_PAGES {
@@ -335,7 +368,7 @@ impl MailboxService {
             };
             let (items, next) = self
                 .rows
-                .list(filter, SCAN_PAGE_SIZE, page_token)
+                .list(tenant, filter, SCAN_PAGE_SIZE, page_token)
                 .await?;
             rows.extend(items);
             if next.is_empty() {
@@ -405,6 +438,17 @@ impl MailboxService {
             );
             return Ok(());
         }
+        let Some(tenant) = tenant_of(&msg.namespace) else {
+            // Not retryable either: the row would belong to no tenant's
+            // Stratum, and there is no other store to hold it in. Never this
+            // service's own tenant instead, which would file it with the wrong
+            // tenant.
+            tracing::error!(
+                delivery_id = %msg.delivery_id,
+                "message whose namespace is in no tenant; not held"
+            );
+            return Ok(());
+        };
 
         let entry = MailboxEntry {
             delivery_id: msg.delivery_id.clone(),
@@ -434,7 +478,7 @@ impl MailboxService {
         };
 
         let delivery_id = entry.delivery_id.clone();
-        match self.rows.insert_if_absent(entry).await {
+        match self.rows.insert_if_absent(&tenant, entry).await {
             Ok(_) => {
                 self.held.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(delivery_id = %delivery_id, "mail held");
@@ -473,8 +517,14 @@ impl MailboxHandler for MailboxService {
         // predicate here that were wider than the caller's own row set would not
         // leak; it would crash. That is the backstop working, not a fallback to
         // rely on.
+        //
+        // A caller in no tenant has no tenant's Stratum to hold their mail, and
+        // `on_message` holds nothing there: their mailbox is empty.
+        let Some(tenant) = tenant_of(&req.namespace) else {
+            return Ok(ListHeldMailResponse::default());
+        };
         let mut held: Vec<MailboxEntry> = self
-            .rows_for_recipient(&req.recipient)
+            .rows_for_recipient(&tenant, &req.recipient)
             .await?
             .into_iter()
             .filter(|e| e.status == MailboxEntryStatus::Held as i32)
@@ -504,6 +554,12 @@ impl MailboxHandler for MailboxService {
         // act and must not disagree about when.
         let now = now_ms();
 
+        // Every id is looked up in the caller's tenant, the only one whose rows
+        // can be theirs. A caller in no tenant holds no rows to retrieve.
+        let Some(tenant) = tenant_of(&req.namespace) else {
+            return Ok(UpdateHeldMailResponse::default());
+        };
+
         let mut retrieved_delivery_ids = Vec::new();
         for delivery_id in &req.delivery_ids {
             // A point read and a conditional replace per id rather than one
@@ -512,7 +568,7 @@ impl MailboxHandler for MailboxService {
             // read-back: the store answers once the write is acked, and an acked
             // write is what the client's very next ListHeldMail reads.
             if self
-                .retrieve(delivery_id, &req.recipient, &req.namespace, now)
+                .retrieve(&tenant, delivery_id, &req.recipient, &req.namespace, now)
                 .await?
             {
                 self.retrieved.fetch_add(1, Ordering::Relaxed);

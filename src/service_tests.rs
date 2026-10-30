@@ -51,10 +51,17 @@ use mailbox_model::types::vservices::query::{
 
 use crate::service::{MailboxEntryStore, MailboxService};
 
-/// The tenant every fixture token carries. Nothing asserts on the literal except
-/// the namespace tests, which need a SECOND value to disagree with it.
-const TENANT: &str = "/acme/eng";
-const OTHER_TENANT: &str = "/acme/sales";
+/// The tenant every fixture token carries, and a second one for the namespace
+/// and routing tests to disagree with. Both are `/tenants/<tid>`: a namespace in
+/// no tenant has no Stratum to hold its mail.
+const TENANT: &str = "/tenants/acme0eng";
+const OTHER_TENANT: &str = "/tenants/acme0sal";
+
+/// The tid of a namespace, as the chassis reads it: the tenant whose Stratum
+/// holds that namespace's rows.
+fn tid(namespace: &str) -> Option<String> {
+    servicemanager::tenant_route::tenant_of_caller_namespace(namespace)
+}
 
 const ALICE: &str = "user:alice";
 const BOB: &str = "user:bob";
@@ -63,7 +70,17 @@ const BOB: &str = "user:bob";
 // The fake stratum
 // ---------------------------------------------------------------------------
 
-/// One record type's rows, answering as stratum's generated write surface does.
+/// One record type's rows in every tenant's Stratum, answering as stratum's
+/// generated write surface does.
+///
+/// ONE STORE PER TENANT, as Stratum is (roadmap
+/// decisions/stratum-per-tenant-2026-10-25.md): rows are keyed by the tid a call
+/// was routed to, so a row is only ever found in the tenant it was written to.
+/// Every call is checked as the generated client and the tenant-owned instance
+/// check it: an empty or malformed `target_tenant` is INVALID_ARGUMENT before
+/// anything is reached, and a write of a row outside the routed tenant is
+/// PERMISSION_DENIED (tacplus#207). `routes` records each call's tenant, so a
+/// test can assert where a call went and not only what it found.
 ///
 /// Every acked write gets the next revision and goes onto `feed`, the change
 /// feed `WatchMailboxEntryChanges` serves; a refused write changes nothing and
@@ -73,14 +90,16 @@ const BOB: &str = "user:bob";
 /// and every write is refused with that code.
 #[derive(Default)]
 struct FakeStratum {
-    /// delivery_id -> (row, revision).
-    rows: Mutex<HashMap<String, (MailboxEntry, i64)>>,
+    /// (tid, delivery_id) -> (row, revision).
+    rows: Mutex<HashMap<(String, String), (MailboxEntry, i64)>>,
     revision: Mutex<i64>,
     feed: Mutex<Vec<MailboxEntryWatchChange>>,
     refuse_writes: Mutex<Option<tonic::Code>>,
     /// Writes another writer lands just before this service's next
     /// `replace_if_unchanged`, so that one finds the entry changed underneath.
     interleaved: Mutex<Vec<MailboxEntry>>,
+    /// (method, target_tenant) of every call, in order.
+    routes: Mutex<Vec<(&'static str, String)>>,
 }
 
 impl FakeStratum {
@@ -99,14 +118,33 @@ impl FakeStratum {
         }
     }
 
-    /// Apply an acked write: the next revision, the row, and the feed.
-    fn commit(&self, entry: MailboxEntry, change: RecordChangeType) -> i64 {
-        let mut revision = self.revision.lock().unwrap();
-        *revision += 1;
-        self.rows
+    /// Record the call's tenant and refuse it as the generated router does.
+    fn route(&self, method: &'static str, tenant: &str) -> Result<(), tonic::Status> {
+        self.routes
             .lock()
             .unwrap()
-            .insert(entry.delivery_id.clone(), (entry.clone(), *revision));
+            .push((method, tenant.to_string()));
+        servicemanager::tenant_route::route_tenant("target_tenant", tenant).map(|_| ())
+    }
+
+    /// A tenant's Stratum holds only that tenant's rows (tacplus#207).
+    fn owned(tenant: &str, entry: &MailboxEntry) -> Result<(), tonic::Status> {
+        match tid(&entry.namespace) {
+            Some(t) if t == tenant => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "fake stratum: row outside the routed tenant",
+            )),
+        }
+    }
+
+    /// Apply an acked write: the next revision, the row, and the feed.
+    fn commit(&self, tenant: &str, entry: MailboxEntry, change: RecordChangeType) -> i64 {
+        let mut revision = self.revision.lock().unwrap();
+        *revision += 1;
+        self.rows.lock().unwrap().insert(
+            (tenant.to_string(), entry.delivery_id.clone()),
+            (entry.clone(), *revision),
+        );
         self.feed.lock().unwrap().push(MailboxEntryWatchChange {
             r#type: change as i32,
             item: Some(entry),
@@ -128,26 +166,52 @@ impl FakeStratum {
             .collect()
     }
 
-    /// Every row, in key order — the order a store with an indexed key would
-    /// page in, so `list` below can page deterministically.
-    fn all(&self) -> Vec<MailboxEntry> {
+    /// Every row of one tenant, in key order — the order a store with an
+    /// indexed key would page in, so `list` below can page deterministically.
+    fn all_in(&self, tenant: &str) -> Vec<MailboxEntry> {
         let mut rows: Vec<MailboxEntry> = self
             .rows
             .lock()
             .unwrap()
-            .values()
-            .map(|(row, _)| row.clone())
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, (row, _))| row.clone())
             .collect();
         rows.sort_by(|a, b| a.delivery_id.cmp(&b.delivery_id));
         rows
     }
 
+    /// Every row of every tenant.
+    fn all(&self) -> Vec<MailboxEntry> {
+        self.rows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(row, _)| row.clone())
+            .collect()
+    }
+
+    /// The row for `delivery_id` in whichever tenant holds it.
     fn stored(&self, delivery_id: &str) -> Option<MailboxEntry> {
         self.rows
             .lock()
             .unwrap()
-            .get(delivery_id)
+            .iter()
+            .find(|((_, id), _)| id == delivery_id)
+            .map(|(_, (row, _))| row.clone())
+    }
+
+    /// The row for `delivery_id` in `tenant`'s Stratum.
+    fn stored_in(&self, tenant: &str, delivery_id: &str) -> Option<MailboxEntry> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&(tenant.to_string(), delivery_id.to_string()))
             .map(|(row, _)| row.clone())
+    }
+
+    fn routes(&self) -> Vec<(&'static str, String)> {
+        self.routes.lock().unwrap().clone()
     }
 }
 
@@ -156,14 +220,16 @@ impl MailboxEntryStore for FakeStratum {
     /// `Get<T>` answers a key only for an entry in the named tenant.
     async fn get(
         &self,
+        tenant: &str,
         delivery_id: &str,
         namespace: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status> {
+        self.route("get", tenant)?;
         Ok(self
             .rows
             .lock()
             .unwrap()
-            .get(delivery_id)
+            .get(&(tenant.to_string(), delivery_id.to_string()))
             .filter(|(row, _)| row.namespace == namespace)
             .cloned())
     }
@@ -174,12 +240,14 @@ impl MailboxEntryStore for FakeStratum {
     /// namespace tests below assert on rows and not on the predicate.
     async fn list(
         &self,
+        tenant: &str,
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
+        self.route("list", tenant)?;
         let matching: Vec<MailboxEntry> = self
-            .all()
+            .all_in(tenant)
             .into_iter()
             .filter(|r| {
                 filter
@@ -198,35 +266,42 @@ impl MailboxEntryStore for FakeStratum {
         Ok((page, next))
     }
 
-    async fn insert_if_absent(&self, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+        self.route("insert_if_absent", tenant)?;
+        Self::owned(tenant, &entry)?;
         self.refusal()?;
-        if self.rows.lock().unwrap().contains_key(&entry.delivery_id) {
+        let key = (tenant.to_string(), entry.delivery_id.clone());
+        if self.rows.lock().unwrap().contains_key(&key) {
             return Err(tonic::Status::already_exists("fake stratum: entry exists"));
         }
-        Ok(self.commit(entry, RecordChangeType::Add))
+        Ok(self.commit(tenant, entry, RecordChangeType::Add))
     }
 
     async fn replace_if_unchanged(
         &self,
+        tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
     ) -> Result<i64, tonic::Status> {
+        self.route("replace_if_unchanged", tenant)?;
+        Self::owned(tenant, &entry)?;
         self.refusal()?;
         for other in std::mem::take(&mut *self.interleaved.lock().unwrap()) {
-            self.commit(other, RecordChangeType::Modify);
+            let other_tenant = tid(&other.namespace).expect("an interleaved row in a tenant");
+            self.commit(&other_tenant, other, RecordChangeType::Modify);
         }
         let current = self
             .rows
             .lock()
             .unwrap()
-            .get(&entry.delivery_id)
+            .get(&(tenant.to_string(), entry.delivery_id.clone()))
             .map(|(_, revision)| *revision);
         match current {
             None => Err(tonic::Status::not_found("fake stratum: no such entry")),
             Some(r) if r != expected_revision => {
                 Err(tonic::Status::aborted("fake stratum: changed underneath"))
             }
-            Some(_) => Ok(self.commit(entry, RecordChangeType::Modify)),
+            Some(_) => Ok(self.commit(tenant, entry, RecordChangeType::Modify)),
         }
     }
 }
@@ -978,6 +1053,10 @@ async fn a_mismatched_namespace_is_refused_on_read() {
         .await
         .expect_err("a namespace the caller does not hold must be refused");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        h.stratum.routes().is_empty(),
+        "a refused namespace reaches no tenant's Stratum"
+    );
 }
 
 #[tokio::test]
@@ -1005,11 +1084,19 @@ async fn a_mismatched_namespace_is_refused_on_write() {
         MailboxEntryStatus::Held as i32,
         "nothing may be written under a refused namespace"
     );
+    assert_eq!(
+        h.stratum.routes(),
+        vec![("insert_if_absent", tid(TENANT).unwrap())],
+        "a refused namespace reaches no tenant's Stratum"
+    );
 }
 
-/// A row stamped with ANOTHER tenant is not returned to this caller.
+/// A row stamped with ANOTHER tenant is not returned to this caller: it is in
+/// the other tenant's Stratum, and the read is routed to the caller's.
 ///
-/// This asserts the SERVICE's predicate, not the generated backstop — and the
+/// The service's own namespace predicate is the second line, for a row of
+/// another namespace in the SAME tenant (the test after this one). It asserts the
+/// SERVICE's predicate, not the generated backstop — and the
 /// difference is why the assertion is worth making. `(spec.store_namespace)`'s
 /// generated filter ABORTS THE PROCESS when it has to drop a row, so if this
 /// service's own namespace predicate were missing, this test would not fail with
@@ -1040,6 +1127,30 @@ async fn a_row_from_another_tenant_is_not_returned() {
     assert_eq!(resp.entries[0].delivery_id, format!("m1/{ALICE}"));
 }
 
+/// One tenant's Stratum holds every namespace below it, so a row of another
+/// namespace in the caller's tenant IS in the store the read reaches. The
+/// service's predicate is what keeps it out (or the backstop would abort).
+#[tokio::test]
+async fn a_row_from_another_namespace_of_the_same_tenant_is_not_returned() {
+    let h = Harness::start().await;
+    let sub = format!("{TENANT}/team");
+    h.deliver(delivery("m1", ALICE, &sub), 1_700_000_100_000)
+        .await;
+    assert!(h.stratum.stored_in(&tid(TENANT).unwrap(), &format!("m1/{ALICE}")).is_some());
+
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+    assert!(resp.entries.is_empty());
+}
+
 /// The cross-tenant row cannot be RETRIEVED either, even naming its exact id.
 #[tokio::test]
 async fn a_row_from_another_tenant_is_not_retrievable() {
@@ -1066,6 +1177,170 @@ async fn a_row_from_another_tenant_is_not_retrievable() {
         h.row(&format!("m2/{ALICE}")).unwrap().status,
         MailboxEntryStatus::Held as i32
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tenant routing: every record-plane call names the tenant of the record
+// ---------------------------------------------------------------------------
+
+/// Every call this service makes of the record plane is routed to the tenant
+/// of the row it is about — never left empty, never another tenant's.
+#[tokio::test]
+async fn every_record_plane_call_is_routed_to_the_rows_tenant() {
+    let h = Harness::start().await;
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    h.wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list");
+    h.wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![format!("m1/{ALICE}")],
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("retrieve");
+
+    let tenant = tid(TENANT).unwrap();
+    let routes = h.stratum.routes();
+    let methods: Vec<&str> = routes.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        vec!["insert_if_absent", "list", "get", "replace_if_unchanged"]
+    );
+    for (method, routed) in &routes {
+        assert_eq!(routed, &tenant, "{method} routed to the wrong tenant");
+    }
+}
+
+/// A delivery for another tenant's recipient lands in THAT tenant's Stratum,
+/// whatever tenant this service runs in, and is read and retrieved there.
+#[tokio::test]
+async fn a_cross_tenant_delivery_lands_in_the_recipient_tenants_stratum() {
+    let h = Harness::start().await;
+    let other = tid(OTHER_TENANT).unwrap();
+    h.deliver(delivery("m1", BOB, OTHER_TENANT), 1_700_000_100_000)
+        .await;
+
+    let id = format!("m1/{BOB}");
+    assert!(h.stratum.stored_in(&other, &id).is_some());
+    assert!(h.stratum.stored_in(&tid(TENANT).unwrap(), &id).is_none());
+    assert_eq!(h.stratum.routes(), vec![("insert_if_absent", other.clone())]);
+
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            BOB,
+            OTHER_TENANT,
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+    assert_eq!(resp.entries.len(), 1);
+
+    let resp = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            BOB,
+            OTHER_TENANT,
+        ))
+        .await
+        .expect("retrieve")
+        .into_inner();
+    assert_eq!(resp.retrieved_delivery_ids, vec![id]);
+    assert!(h.stratum.routes().iter().all(|(_, t)| t == &other));
+}
+
+/// A delivery whose namespace is in no tenant has no tenant's Stratum to be
+/// held in: it is dropped rather than retried, and nothing is called with an
+/// empty or made-up tenant.
+#[tokio::test]
+async fn a_delivery_in_no_tenant_is_dropped_not_routed() {
+    let h = Harness::start().await;
+    for namespace in ["", "/system", "/acme/eng", "/tenants/Not-A-Tid"] {
+        h.deliver(delivery("m1", ALICE, namespace), 1_700_000_100_000)
+            .await;
+    }
+    assert!(h.rows().is_empty());
+    assert!(h.stratum.routes().is_empty());
+}
+
+/// A caller in no tenant has an empty mailbox, and asking reaches no store.
+#[tokio::test]
+async fn a_caller_in_no_tenant_reaches_no_store() {
+    let h = Harness::start().await;
+    let resp = h
+        .wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest::default(),
+            ALICE,
+            "/system",
+        ))
+        .await
+        .expect("list")
+        .into_inner();
+    assert!(resp.entries.is_empty());
+
+    let resp = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![format!("m1/{ALICE}")],
+                ..Default::default()
+            },
+            ALICE,
+            "/system",
+        ))
+        .await
+        .expect("retrieve")
+        .into_inner();
+    assert!(resp.retrieved_delivery_ids.is_empty());
+    assert!(h.stratum.routes().is_empty());
+}
+
+/// The store refuses a row outside the tenant it was routed to (tacplus#207),
+/// and a call that names no tenant. Through the service neither can happen — the tenant is the row's own — so the seam is driven directly, to
+/// pin the fake to the refusal the tests above rely on it making.
+#[tokio::test]
+async fn the_store_refuses_a_row_outside_the_routed_tenant() {
+    let h = Harness::start().await;
+    let mut row = MailboxEntry {
+        delivery_id: format!("m1/{ALICE}"),
+        recipient: ALICE.to_string(),
+        namespace: OTHER_TENANT.to_string(),
+        ..Default::default()
+    };
+    let err = h
+        .stratum
+        .insert_if_absent(&tid(TENANT).unwrap(), row.clone())
+        .await
+        .expect_err("a row of another tenant");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    let err = h
+        .stratum
+        .insert_if_absent("", row.clone())
+        .await
+        .expect_err("no tenant");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    row.namespace = TENANT.to_string();
+    h.stratum
+        .insert_if_absent(&tid(TENANT).unwrap(), row)
+        .await
+        .expect("a row of the routed tenant");
 }
 
 // ---------------------------------------------------------------------------

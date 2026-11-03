@@ -99,7 +99,14 @@ pub trait MailboxEntryStore: Send + Sync {
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status>;
 
     /// Write `entry` unless its key exists: its revision, or ALREADY_EXISTS.
-    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status>;
+    /// `trace_id` is the causing request's (field 200), carried on the write
+    /// as it came, empty when it came with none (tacplus-dev/looper#51).
+    async fn insert_if_absent(
+        &self,
+        tenant: &str,
+        entry: MailboxEntry,
+        trace_id: &str,
+    ) -> Result<i64, tonic::Status>;
 
     /// Replace the row `entry` keys if it is still at `expected_revision`: the
     /// new revision, ABORTED when it changed underneath, NOT_FOUND when absent.
@@ -181,12 +188,18 @@ impl MailboxEntryStore for RecordPlaneStore {
         Ok((rows, next))
     }
 
-    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+    async fn insert_if_absent(
+        &self,
+        tenant: &str,
+        entry: MailboxEntry,
+        trace_id: &str,
+    ) -> Result<i64, tonic::Status> {
         Ok(self
             .client()
             .insert_if_absent_mailbox_entry(InsertIfAbsentMailboxEntryRequest {
                 item: Some(entry),
                 target_tenant: tenant.to_string(),
+                trace_id: trace_id.to_string(),
                 ..Default::default()
             })
             .await?
@@ -450,6 +463,9 @@ impl MailboxService {
             return Ok(());
         };
 
+        // The insert below is this delivery's and nothing else's, so it carries
+        // the delivery's trace_id (tacplus-dev/looper#51).
+        let trace_id = msg.trace_id;
         let entry = MailboxEntry {
             delivery_id: msg.delivery_id.clone(),
             message_id: msg.message_id,
@@ -478,7 +494,7 @@ impl MailboxService {
         };
 
         let delivery_id = entry.delivery_id.clone();
-        match self.rows.insert_if_absent(&tenant, entry).await {
+        match self.rows.insert_if_absent(&tenant, entry, &trace_id).await {
             Ok(_) => {
                 self.held.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(delivery_id = %delivery_id, "mail held");

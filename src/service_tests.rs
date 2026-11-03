@@ -49,7 +49,8 @@ use mailbox_model::types::vservices::query::{
     MailboxEntryFilter, MailboxEntryWatchChange, RecordChangeType,
 };
 
-use crate::service::{MailboxEntryStore, MailboxService};
+use crate::service::{MailboxEntryStore, MailboxService, MailboxServiceHandler};
+use mailbox_model::s2sm::handler::Handler;
 
 /// The tenant every fixture token carries, and a second one for the namespace
 /// and routing tests to disagree with. Both are `/tenants/<tid>`: a namespace in
@@ -100,6 +101,9 @@ struct FakeStratum {
     interleaved: Mutex<Vec<MailboxEntry>>,
     /// (method, target_tenant) of every call, in order.
     routes: Mutex<Vec<(&'static str, String)>>,
+    /// (method, trace_id) of every call that carries one, in order: the
+    /// `trace_id` (field 200) the call would put on the wire.
+    traces: Mutex<Vec<(&'static str, String)>>,
 }
 
 impl FakeStratum {
@@ -213,6 +217,18 @@ impl FakeStratum {
     fn routes(&self) -> Vec<(&'static str, String)> {
         self.routes.lock().unwrap().clone()
     }
+
+    /// Record the `trace_id` a call carries.
+    fn trace(&self, method: &'static str, trace_id: &str) {
+        self.traces
+            .lock()
+            .unwrap()
+            .push((method, trace_id.to_string()));
+    }
+
+    fn traces(&self) -> Vec<(&'static str, String)> {
+        self.traces.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -266,7 +282,13 @@ impl MailboxEntryStore for FakeStratum {
         Ok((page, next))
     }
 
-    async fn insert_if_absent(&self, tenant: &str, entry: MailboxEntry) -> Result<i64, tonic::Status> {
+    async fn insert_if_absent(
+        &self,
+        tenant: &str,
+        entry: MailboxEntry,
+        trace_id: &str,
+    ) -> Result<i64, tonic::Status> {
+        self.trace("insert_if_absent", trace_id);
         self.route("insert_if_absent", tenant)?;
         Self::owned(tenant, &entry)?;
         self.refusal()?;
@@ -638,6 +660,44 @@ async fn a_delivery_with_no_key_is_dropped_not_retried() {
     h.deliver(msg, 1_700_000_100_000).await;
     assert!(h.rows().is_empty());
     assert!(h.watched().is_empty());
+}
+
+/// The delivery's `trace_id` (field 200) rides on the write it causes
+/// (tacplus-dev/looper#51): the consumer-group callback's insert carries the
+/// value the delivery arrived with, and an untraced delivery is still held,
+/// its insert carrying the empty value it came with.
+#[tokio::test]
+async fn a_delivery_carries_its_trace_id_to_the_insert() {
+    let h = Harness::start().await;
+    let handler = MailboxServiceHandler::new(h.svc.clone());
+
+    let mut msg = delivery("m1", ALICE, TENANT);
+    msg.trace_id = "t-1".to_string();
+    handler
+        .on_stream_messaging_message_bus_stream(msg, meta_at(1_700_000_100_000))
+        .await
+        .expect("consume");
+    assert_eq!(h.stratum.traces(), vec![("insert_if_absent", "t-1".to_string())]);
+
+    handler
+        .on_stream_messaging_message_bus_stream(
+            delivery("m2", ALICE, TENANT),
+            meta_at(1_700_000_100_000),
+        )
+        .await
+        .expect("consume");
+    assert_eq!(
+        h.stratum.traces(),
+        vec![
+            ("insert_if_absent", "t-1".to_string()),
+            ("insert_if_absent", String::new()),
+        ]
+    );
+    assert_eq!(
+        h.row(&format!("m2/{ALICE}")).unwrap().status,
+        MailboxEntryStatus::Held as i32,
+        "an untraced delivery is held all the same"
+    );
 }
 
 /// While stratum's redo is unreachable it refuses every write, and the delivery
@@ -1326,19 +1386,19 @@ async fn the_store_refuses_a_row_outside_the_routed_tenant() {
     };
     let err = h
         .stratum
-        .insert_if_absent(&tid(TENANT).unwrap(), row.clone())
+        .insert_if_absent(&tid(TENANT).unwrap(), row.clone(), "")
         .await
         .expect_err("a row of another tenant");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     let err = h
         .stratum
-        .insert_if_absent("", row.clone())
+        .insert_if_absent("", row.clone(), "")
         .await
         .expect_err("no tenant");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     row.namespace = TENANT.to_string();
     h.stratum
-        .insert_if_absent(&tid(TENANT).unwrap(), row)
+        .insert_if_absent(&tid(TENANT).unwrap(), row, "")
         .await
         .expect("a row of the routed tenant");
 }

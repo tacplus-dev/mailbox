@@ -262,8 +262,10 @@ impl MailboxEntryStore for FakeStratum {
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
+        trace_id: &str,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
         self.route("list", tenant)?;
+        self.trace("list", trace_id);
         let matching: Vec<MailboxEntry> = self
             .all_in(tenant)
             .into_iter()
@@ -1641,6 +1643,43 @@ async fn list_held_mail_pages_the_store() {
     assert_eq!(resp.entries.len(), 100);
     assert_eq!(resp.entries[0].delivery_id, format!("m0000/{ALICE}"));
     assert_eq!(resp.entries[99].delivery_id, format!("m0099/{ALICE}"));
+}
+
+/// The request's `trace_id` (field 200) rides on every page of the scan it
+/// causes (tacplus-dev/looper#51), the last page included.
+#[tokio::test]
+async fn list_held_mail_carries_its_trace_id_to_every_page() {
+    let h = Harness::start().await;
+    // More rows than one page of the scan, so the scan takes several.
+    for i in 0..450 {
+        h.deliver(
+            delivery(&format!("m{i:04}"), ALICE, TENANT),
+            1_700_000_100_000,
+        )
+        .await;
+    }
+
+    h.wrapper
+        .list_held_mail(Harness::signed(
+            ListHeldMailRequest {
+                trace_id: "t-3".to_string(),
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("list");
+
+    let pages: Vec<_> = h
+        .stratum
+        .traces()
+        .into_iter()
+        .filter(|(method, _)| *method != "insert_if_absent")
+        .collect();
+    // 450 rows at 200 a page: three pages, each traced.
+    let t3 = || ("list", "t-3".to_string());
+    assert_eq!(pages, vec![t3(), t3(), t3()]);
 }
 
 // ---------------------------------------------------------------------------

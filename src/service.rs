@@ -98,6 +98,7 @@ pub trait MailboxEntryStore: Send + Sync {
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
+        trace_id: &str,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status>;
 
     /// Write `entry` unless its key exists: its revision, or ALREADY_EXISTS.
@@ -184,7 +185,11 @@ impl MailboxEntryStore for RecordPlaneStore {
         filter: MailboxEntryFilter,
         page_size: i32,
         page_token: String,
+        _trace_id: &str,
     ) -> Result<(Vec<MailboxEntry>, String), tonic::Status> {
+        // The generated reader takes no trace_id and builds its create, page
+        // and release requests with field 200 empty, so the causing request's
+        // trace_id stops here until it takes one (tacplus-dev/tacplus#313).
         let (rows, next, _total) = self
             .0
             .mailbox_entry_record_reader()
@@ -383,11 +388,13 @@ impl MailboxService {
     /// is deliberately not a `(spec.query_field)` (it exists to BE the egress
     /// boundary), and one tenant's store holds every namespace below it, so the
     /// caller's verified namespace is compared here, on rows, by the callers of
-    /// this method.
+    /// this method. Every page is the request's, so each carries its
+    /// `trace_id` (tacplus-dev/looper#51).
     async fn rows_for_recipient(
         &self,
         tenant: &str,
         recipient: &str,
+        trace_id: &str,
     ) -> Result<Vec<MailboxEntry>, tonic::Status> {
         let mut rows = Vec::new();
         let mut page_token = String::new();
@@ -398,7 +405,7 @@ impl MailboxService {
             };
             let (items, next) = self
                 .rows
-                .list(tenant, filter, SCAN_PAGE_SIZE, page_token)
+                .list(tenant, filter, SCAN_PAGE_SIZE, page_token, trace_id)
                 .await?;
             rows.extend(items);
             if next.is_empty() {
@@ -557,7 +564,7 @@ impl MailboxHandler for MailboxService {
             return Ok(ListHeldMailResponse::default());
         };
         let mut held: Vec<MailboxEntry> = self
-            .rows_for_recipient(&tenant, &req.recipient)
+            .rows_for_recipient(&tenant, &req.recipient, &req.trace_id)
             .await?
             .into_iter()
             .filter(|e| e.status == MailboxEntryStatus::Held as i32)

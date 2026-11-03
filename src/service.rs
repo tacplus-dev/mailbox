@@ -80,12 +80,14 @@ pub trait MailboxEntryStore: Send + Sync {
     /// One row of the tenant `namespace` by record key, with its revision, or
     /// `None` when the store holds none. A miss is an ordinary answer: "no such
     /// delivery" and "the store is unreachable" must not look alike to the
-    /// callers below.
+    /// callers below. `trace_id` is the causing request's, as on every call
+    /// below that takes one.
     async fn get(
         &self,
         tenant: &str,
         delivery_id: &str,
         namespace: &str,
+        trace_id: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status>;
 
     /// One page of `tenant`'s rows matching `filter`, with the next page token
@@ -115,6 +117,7 @@ pub trait MailboxEntryStore: Send + Sync {
         tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
+        trace_id: &str,
     ) -> Result<i64, tonic::Status>;
 }
 
@@ -153,6 +156,7 @@ impl MailboxEntryStore for RecordPlaneStore {
         tenant: &str,
         delivery_id: &str,
         namespace: &str,
+        trace_id: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status> {
         let resp = self
             .client()
@@ -160,6 +164,7 @@ impl MailboxEntryStore for RecordPlaneStore {
                 delivery_id: delivery_id.to_string(),
                 namespace: namespace.to_string(),
                 target_tenant: tenant.to_string(),
+                trace_id: trace_id.to_string(),
                 ..Default::default()
             })
             .await;
@@ -212,6 +217,7 @@ impl MailboxEntryStore for RecordPlaneStore {
         tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
+        trace_id: &str,
     ) -> Result<i64, tonic::Status> {
         Ok(self
             .client()
@@ -221,6 +227,7 @@ impl MailboxEntryStore for RecordPlaneStore {
                     expected_revision,
                 )),
                 target_tenant: tenant.to_string(),
+                trace_id: trace_id.to_string(),
                 ..Default::default()
             })
             .await?
@@ -313,6 +320,9 @@ impl MailboxService {
     /// refusal — UNAVAILABLE while stratum's redo is unreachable, above all — is
     /// the caller's answer: the row is still HELD and must not be reported
     /// otherwise.
+    ///
+    /// Every read and replace, the re-reads included, is the retrieving
+    /// request's, so each carries its `trace_id` (tacplus-dev/looper#51).
     async fn retrieve(
         &self,
         tenant: &str,
@@ -320,11 +330,14 @@ impl MailboxService {
         recipient: &str,
         namespace: &str,
         now: i64,
+        trace_id: &str,
     ) -> Result<bool, tonic::Status> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let Some((entry, revision)) = self.rows.get(tenant, delivery_id, namespace).await? else {
+            let Some((entry, revision)) =
+                self.rows.get(tenant, delivery_id, namespace, trace_id).await?
+            else {
                 // An id naming no row is absent from the response, not an error.
                 return Ok(false);
             };
@@ -346,7 +359,11 @@ impl MailboxService {
             let mut updated = entry;
             updated.status = MailboxEntryStatus::Retrieved as i32;
             updated.retrieved_at_ms = now;
-            match self.rows.replace_if_unchanged(tenant, updated, revision).await {
+            match self
+                .rows
+                .replace_if_unchanged(tenant, updated, revision, trace_id)
+                .await
+            {
                 Ok(_) => return Ok(true),
                 Err(status) if status.code() == tonic::Code::NotFound => return Ok(false),
                 Err(status)
@@ -584,7 +601,14 @@ impl MailboxHandler for MailboxService {
             // read-back: the store answers once the write is acked, and an acked
             // write is what the client's very next ListHeldMail reads.
             if self
-                .retrieve(&tenant, delivery_id, &req.recipient, &req.namespace, now)
+                .retrieve(
+                    &tenant,
+                    delivery_id,
+                    &req.recipient,
+                    &req.namespace,
+                    now,
+                    &req.trace_id,
+                )
                 .await?
             {
                 self.retrieved.fetch_add(1, Ordering::Relaxed);

@@ -239,7 +239,9 @@ impl MailboxEntryStore for FakeStratum {
         tenant: &str,
         delivery_id: &str,
         namespace: &str,
+        trace_id: &str,
     ) -> Result<Option<(MailboxEntry, i64)>, tonic::Status> {
+        self.trace("get", trace_id);
         self.route("get", tenant)?;
         Ok(self
             .rows
@@ -304,7 +306,9 @@ impl MailboxEntryStore for FakeStratum {
         tenant: &str,
         entry: MailboxEntry,
         expected_revision: i64,
+        trace_id: &str,
     ) -> Result<i64, tonic::Status> {
+        self.trace("replace_if_unchanged", trace_id);
         self.route("replace_if_unchanged", tenant)?;
         Self::owned(tenant, &entry)?;
         self.refusal()?;
@@ -1537,6 +1541,68 @@ async fn a_retrieval_changed_underneath_is_retried_on_the_new_row() {
     let row = h.row(&id).unwrap();
     assert_eq!(row.status, MailboxEntryStatus::Retrieved as i32);
     assert_eq!(row.subject, "standup, moved", "the other write is not undone");
+}
+
+/// The request's `trace_id` (field 200) rides on every read and write it causes
+/// (tacplus-dev/looper#51): each id's get, its replace, and — after an ABORTED
+/// replace — the re-read and the replace made again; an id naming no row still
+/// costs one traced get.
+#[tokio::test]
+async fn a_retrieval_carries_its_trace_id_to_every_get_and_replace() {
+    let h = Harness::start().await;
+    h.deliver(delivery("m1", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    h.deliver(delivery("m2", ALICE, TENANT), 1_700_000_100_000)
+        .await;
+    let mut other = h.row(&format!("m1/{ALICE}")).unwrap();
+    other.subject = "standup, moved".to_string();
+    h.stratum.interleave(other);
+
+    let resp = h
+        .wrapper
+        .update_held_mail(Harness::signed(
+            UpdateHeldMailRequest {
+                delivery_ids: vec![
+                    format!("m1/{ALICE}"),
+                    format!("m2/{ALICE}"),
+                    format!("m3/{ALICE}"),
+                ],
+                trace_id: "t-2".to_string(),
+                ..Default::default()
+            },
+            ALICE,
+            TENANT,
+        ))
+        .await
+        .expect("retrieve")
+        .into_inner();
+    assert_eq!(
+        resp.retrieved_delivery_ids,
+        vec![format!("m1/{ALICE}"), format!("m2/{ALICE}")]
+    );
+
+    let t2 = || "t-2".to_string();
+    let caused: Vec<_> = h
+        .stratum
+        .traces()
+        .into_iter()
+        .filter(|(method, _)| *method != "insert_if_absent")
+        .collect();
+    assert_eq!(
+        caused,
+        vec![
+            // m1: replaced ABORTED, read again, replaced.
+            ("get", t2()),
+            ("replace_if_unchanged", t2()),
+            ("get", t2()),
+            ("replace_if_unchanged", t2()),
+            // m2.
+            ("get", t2()),
+            ("replace_if_unchanged", t2()),
+            // m3: no such row.
+            ("get", t2()),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------

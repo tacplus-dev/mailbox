@@ -8,3 +8,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-02 looper issue Gates fail on main: Cargo.lock is stale against the chassis tacplus 2.5.6 generates (ed25519-dalek 3, sha2 0.11) (#9, 1f568da)
 - 2026-11-03 looper issue Trace propagation: on_message drops the delivery's trace_id on InsertIfAbsentMailboxEntry, and no test asserts it (#10)
 - 2026-11-03 looper issue Trace propagation: UpdateHeldMail drops its trace_id on GetMailboxEntry and ReplaceIfUnchangedMailboxEntry, and no test asserts it (#11)
+- 2026-11-06 looper issue tacplus floor 2.5 is behind the latest released line (2.6): move the floor to 2.6 and commit tacplus.lock (#13, c9a7b1a)

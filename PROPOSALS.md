@@ -21,6 +21,12 @@ the looper then marks it `promoted` or `declined` here with the date.
 - **`UpdateHeldMail` as one `Apply`** (2026-10-29, #7): retrieving a page is one conditional replace per id, so a
   refusal midway leaves the earlier ids retrieved (retrying is idempotent). One `Apply` in canonical key order would
   make the page all or nothing, at the cost of one ABORTED failing the whole page.
+- **A security checks pipeline, and a README "Security checks" section** (2026-11-06, nightly scan): the build
+  runs only `planning-files`, so there is no security report for the nightly scan to read. The scan has to run
+  `cargo audit` itself, and nothing checks the image. A workflow like fleet-seatrials' `.github/workflows/security.yml`
+  (cargo audit on `Cargo.lock`, an image scan of the distroless runtime) would let the scan read a report and catch
+  advisories on every push, not just nightly. The README should name the workflow and say where its report lives.
+  Platform context: tacplus-dev/roadmap ROADMAP.md, Later, "Automatic security remediation" (looper#49).
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

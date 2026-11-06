@@ -1,7 +1,9 @@
 kind: service
-# compiler floor: the looper runs the latest 2.5.x image; 2.5 brings the
-# record write surface stratum is written through (tacplus#163, #7).
-tacplus: "2.5"
+# compiler floor: the latest released line (2.6, #13). From 2.6 there is no
+# tacplus image: tacplus.lock pins the release and its build:2.6 image by
+# digest (`tacplus pin` moves it, in a commit). 2.5 brought the record write
+# surface stratum is written through (tacplus#163, #7).
+tacplus: "2.6"
 language: rust
 # Rust takes only pkg's last segment: the crate stays mailbox-model.
 pkg: com.github.tacplusdev.mailbox

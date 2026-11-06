@@ -1,8 +1,8 @@
 # State: mailbox
 
-Overwritten to stay current (loopers and agents). Last updated: 2026-11-03 by looper (#11).
+Overwritten to stay current (loopers and agents). Last updated: 2026-11-06 by looper (#13).
 
-- **Version / line:** unreleased (no tag; v0.1.0 is #2); tacplus floor 2.5
+- **Version / line:** unreleased (no tag; v0.1.0 is #2); tacplus floor 2.6, pinned to 2.6.1 and its build image by digest in `tacplus.lock` (#13)
 - **Works:** pull delivery for `messaging.Message`: a third consumer group on `messaging.MessageBus.stream` holds
   each delivery as a `HELD` `MailboxEntry`; `ListHeldMail` and `UpdateHeldMail`. Rows live in Stratum only, written
   through its generated write surface (`InsertIfAbsent`, `ReplaceIfUnchanged`, LOCAL durability) and read through

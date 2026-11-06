@@ -1,0 +1,4 @@
+# The tacplus release and build image every build of this repository runs, exactly.
+# Written by `tacplus pin`; move it with `tacplus pin`, in a commit. A build never moves it.
+tacplus: 2.6.1
+build_image: ghcr.io/tacplus-dev/tacplus/build:2.6.1@sha256:91f42995e0e3d6f959a7f75177caf94b2aded90fc36c8492dbcd320ca0d187f5

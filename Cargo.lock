@@ -1387,6 +1387,7 @@ version = "1.0.0"
 dependencies = [
  "am",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "key",
  "logger",

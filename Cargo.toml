@@ -49,3 +49,6 @@ key = { path = "target/generated-sources/model/chassis/key" }
 am = { path = "target/generated-sources/model/chassis/am" }
 # Decodes the form the gmail tests' fake Google token endpoint receives.
 serde_urlencoded = "0.7"
+# Makes the gmail tests' throwaway service-account key at run time, so no private
+# key is committed (#14). The same crate the key path dependency builds for RSA.
+aws-lc-rs = "1"

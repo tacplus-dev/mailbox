@@ -27,6 +27,11 @@ the looper then marks it `promoted` or `declined` here with the date.
   (cargo audit on `Cargo.lock`, an image scan of the distroless runtime) would let the scan read a report and catch
   advisories on every push, not just nightly. The README should name the workflow and say where its report lives.
   Platform context: tacplus-dev/roadmap ROADMAP.md, Later, "Automatic security remediation" (looper#49).
+- **ROADMAP "Now": the floor in force** (2026-11-08, #14): Jody asked #14 to update "Now" to the floor in force, but a
+  looper commit may not touch ROADMAP.md. For an agent at his request: "Released v0.1.x; tacplus floor 2.6 (2.6.1
+  pinned in tacplus.lock). Not yet in seatrials." (now: "Unreleased; tacplus floor 2.4").
+- **Move the pin to 2.6.2** (2026-11-08, #14): v2.6.2 was released while #14 ran (Kani harnesses, image rebuilds; no
+  change mailbox needs). `tacplus pin` in a commit of its own, when a change wants it.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

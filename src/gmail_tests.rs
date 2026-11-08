@@ -4,8 +4,9 @@
 //! reaches Google.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der};
 use base64::Engine;
 use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use rustls_pki_types::pem::PemObject;
@@ -18,37 +19,27 @@ use mailbox_model::types::services::mailbox::mailbox::GmailConfig;
 
 use crate::gmail::{GmailAdapter, OutboundMail};
 
-/// A throwaway 2048-bit RSA key in the PKCS#8 PEM a Google key file carries.
-const TEST_SA_PEM: &str = concat!(
-    "-----BEGIN PRIVATE KEY-----\n",
-    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDbPM1T/8VZ4rO/\n",
-    "l+URZ0roQup3dTeO4qgUWhRlGp39Se4CRoabNJVrOo7lXbdS5poSkgWewciNd7w0\n",
-    "z+7vlIMMaoO4TexGB9z+3Z8Vu3HVBx3GvaAEYIuVL3wSkbf+K4Wd3LivCHZQTGbo\n",
-    "nweOAsvB4HqQjGwyUMjk5vdSATR+MX5qjs4g38OJyOZHSOh2fxn6uzJTYKT9YLjW\n",
-    "/F6NGCMZmpXgHns92ztX1ptK9AjFlu26QTPAKkYb/jZSfzumOcOGOQIsHyv9nOBi\n",
-    "tz7FOA11i84flORDqdrfh5eKKo+4jxmK0xgtIMGEmypzg1C+vtxZv2jqHxb0bhuO\n",
-    "VylOLKP5AgMBAAECggEAA8INOPobkr/Pdmmu+JOtavpbG/vgx/rYT0iOAfFwP4X3\n",
-    "LPldgoqRfHNWPStGIpVgIUl4777ku63WsRxk59Xfl6SdUtkrimBwBJ8PWcO817qy\n",
-    "OJSfbaA5XvcDPg7pDoywxLTptGl+OM566HDjo/wl826MlC68BoCMjlsISigtduVh\n",
-    "mmIEoK0XRB3cdMeiLS8tUb8xwx8AYYemaoldw9uFfu7cGqqYd2JoQblNnIa5q4Hy\n",
-    "dsO0MUqPc4ifrzXS5B5qKCYAbgL1LxTfUvwblEOO9pez9kD8JWwb3NfSTlVkncYX\n",
-    "1amhVf6/pgQ4zcjFLCFJYAV0eIEJlsYtEb5QzT4RGwKBgQD7R4XAFkcQK/OEo/Gv\n",
-    "A2ryKBlhTOzxkWzXXf25cwYH+l/bm76ppeJcNBlRTR8Kd/Mhe/iRfF8r1fQOT+FO\n",
-    "OY5To66qsbfzKe+pPstDDEZR+aUWyjzmUdda0T7L/MhmnZlT2o4+joSFZZPis/i+\n",
-    "widCrWBLUoQeeVAb1ZCGrVQMqwKBgQDfWy4/co/nAq1VY5Bh0ECkcN4dUa539nJ4\n",
-    "AmgMKtsk1Hqj1w8096XnMxUcmx7SBAuXhDFMZHZM9LTqrzxOvj65p1S4lACUduP6\n",
-    "q5PkccaZJ0GAgyW90SbXF6Lc9mq+LZLFU5EnIlhBXYkc1DyBWUYEdFayzQd1jhj7\n",
-    "s5lNQrkJ6wKBgQDmgYLRZd5EmHzoRVhUmscFYwF9P4rwQt5cZm11LG3w7Z33n9R0\n",
-    "XabbvDMpYJzEBqrzIX0xQK0xUjBy3JYrIyNL2JBHJ4Y+O08Nq3vcgqsTUfY+hMD+\n",
-    "6z6pod+AUuAnOhVIVeo8upIYqMjToxLhMsu/H7qA/i4Somh5UB0nXmMGxwKBgEPK\n",
-    "VeAV8k0oB9nZzTGS1nvSceeuKejpGNcJy/CddUPZZZuio0/tNiJU47x57EHLzoTf\n",
-    "L2NDPpCe2OY952zy2vDYM6ON8BsfdpRXTRzR13gWbRAHPgY9m68+0kSEWeN8y4Yu\n",
-    "leityOGV9Q6V8ANGSDUD5miASBpK1ZRXb1j+vlCfAoGBAPUkVx1Req3yJDzV4elC\n",
-    "EkvBhmQTWoHhPvRnrOoWkaRVDnh62/IPwaDAI2Y58Nkzb7Ia1wdgV6DbOEluLBiP\n",
-    "aGJC4+xRUNp1g7zVwvS7ooa/zdZET6UZ9TpIdnsdqjbcR9uXhl7Iy7AywQJrj8/J\n",
-    "2ExX0/KfnUYcLNMIi3DE/FMO\n",
-    "-----END PRIVATE KEY-----\n",
-);
+/// A throwaway 2048-bit RSA key in the PKCS#8 PEM a Google key file carries,
+/// made once per test run. None is committed: the build's secret scan refuses a
+/// private key in the tree (#14). ring cannot generate RSA keys; aws-lc-rs, the
+/// one the chassis key crate already builds, can.
+fn test_sa_pem() -> &'static str {
+    static PEM: OnceLock<String> = OnceLock::new();
+    PEM.get_or_init(|| {
+        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let der: Pkcs8V1Der = key.as_der().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+        let body: String = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
+            .collect();
+        // The label apart from the armor: written out whole, the armor around
+        // a key's builder reads to the secret scan as a committed key.
+        let label = "PRIVATE KEY";
+        format!("-----BEGIN {label}-----\n{body}-----END {label}-----\n")
+    })
+}
 
 const SA_EMAIL: &str = "crew-mail@test-project.iam.gserviceaccount.com";
 const MAILBOX: &str = "hello@example.test";
@@ -72,7 +63,7 @@ pub(crate) fn key_file(token_uri: &str) -> String {
     json!({
         "type": "service_account",
         "client_email": SA_EMAIL,
-        "private_key": TEST_SA_PEM,
+        "private_key": test_sa_pem(),
         "token_uri": token_uri,
     })
     .to_string()
@@ -153,7 +144,7 @@ fn google_accepts(form: &HashMap<String, String>, token_uri: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    let der = PrivatePkcs8KeyDer::from_pem_slice(TEST_SA_PEM.as_bytes()).unwrap();
+    let der = PrivatePkcs8KeyDer::from_pem_slice(test_sa_pem().as_bytes()).unwrap();
     let key = RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()).unwrap();
     let public = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key().as_ref());
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]).ok();

@@ -1,4 +1,6 @@
 # Runtime base per #2 (hub, 2026-10-27): distroless.
 FROM gcr.io/distroless/cc-debian13
 COPY target/release/mailbox /usr/local/bin/mailbox
+# distroless's nonroot user (65532): the service needs no root (#14).
+USER nonroot
 ENTRYPOINT ["mailbox"]

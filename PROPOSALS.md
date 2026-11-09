@@ -31,7 +31,8 @@ the looper then marks it `promoted` or `declined` here with the date.
   looper commit may not touch ROADMAP.md. For an agent at his request: "Released v0.1.x; tacplus floor 2.6 (2.6.1
   pinned in tacplus.lock). Not yet in seatrials." (now: "Unreleased; tacplus floor 2.4").
 - **Move the pin to 2.6.2** (2026-11-08, #14): v2.6.2 was released while #14 ran (Kani harnesses, image rebuilds; no
-  change mailbox needs). `tacplus pin` in a commit of its own, when a change wants it.
+  change mailbox needs). `tacplus pin` in a commit of its own, when a change wants it. Nightly scan 2026-11-09: v2.6.3
+  and v2.6.4 followed on 2026-11-08, so the newest patch of the 2.6 floor is now 2.6.4 (the pin is still 2.6.1).
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

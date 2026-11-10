@@ -33,6 +33,18 @@ the looper then marks it `promoted` or `declined` here with the date.
 - **Move the pin to 2.6.2** (2026-11-08, #14): v2.6.2 was released while #14 ran (Kani harnesses, image rebuilds; no
   change mailbox needs). `tacplus pin` in a commit of its own, when a change wants it. Nightly scan 2026-11-09: v2.6.3
   and v2.6.4 followed on 2026-11-08, so the newest patch of the 2.6 floor is now 2.6.4 (the pin is still 2.6.1).
+  Nightly scan 2026-11-10: v2.6.5 (2026-11-09, a cross-test change only) is now the newest; 2.6 is still the latest line.
+  None of these patches carries tacplus-dev/tacplus#368 (still open), which #15 waits on.
+- **Unmaintained crates in the generated chassis** (2026-11-10, nightly scan): `osv-scanner` on `Cargo.lock` warns on
+  `backoff` 0.4.0 (RUSTSEC-2025-0012) and `instant` 0.1.13 (RUSTSEC-2024-0384) via `httpclient`, `rustls-pemfile`
+  2.2.0 (RUSTSEC-2025-0134) via `httpclient`, `servicemanager` and `mailbox-model`, and `unsafe-libyaml` 0.2.11
+  (RUSTSEC-2024-0449) via `serde_yaml`. None has a fixed version, and every one comes from tacplus-generated code. So
+  this is tacplus's to replace (backoff → backon, say; rustls-pki-types' PEM reader), as part of
+  tacplus-dev/roadmap `items/tacplus-security-sweep.md`. It does not fail the floor today (no severity, no fix).
+- **The scan's security report** (2026-11-10, nightly scan): the build pipeline now runs the security floor on this
+  repository (#14), but tonight's scan run directory had no `security-mailbox` report in it. So the scan audited
+  `Cargo.lock` itself again (and found #16). Fetching the report into the scan's run directory is looper's to fix.
+  Until then, the "security checks pipeline" proposal above is half done.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

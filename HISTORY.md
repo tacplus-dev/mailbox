@@ -9,3 +9,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-03 looper issue Trace propagation: on_message drops the delivery's trace_id on InsertIfAbsentMailboxEntry, and no test asserts it (#10)
 - 2026-11-03 looper issue Trace propagation: UpdateHeldMail drops its trace_id on GetMailboxEntry and ReplaceIfUnchangedMailboxEntry, and no test asserts it (#11)
 - 2026-11-06 looper issue tacplus floor 2.5 is behind the latest released line (2.6): move the floor to 2.6 and commit tacplus.lock (#13, c9a7b1a)
+- 2026-11-08 looper issue Pin the build: floor 2.6 and a committed tacplus.lock, so the build pipeline and its security checks run on this repository (#14, b0067fc)

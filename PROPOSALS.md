@@ -35,6 +35,8 @@ the looper then marks it `promoted` or `declined` here with the date.
   and v2.6.4 followed on 2026-11-08, so the newest patch of the 2.6 floor is now 2.6.4 (the pin is still 2.6.1).
   Nightly scan 2026-11-10: v2.6.5 (2026-11-09, a cross-test change only) is now the newest; 2.6 is still the latest line.
   None of these patches carries tacplus-dev/tacplus#368 (still open), which #15 waits on.
+  Nightly scan 2026-11-11: v2.6.8 (2026-11-11, registry.json layout, tacplus#412) is now the newest; 2.6 is still the
+  latest line, and tacplus#368 is still open.
 - **Unmaintained crates in the generated chassis** (2026-11-10, nightly scan): `osv-scanner` on `Cargo.lock` warns on
   `backoff` 0.4.0 (RUSTSEC-2025-0012) and `instant` 0.1.13 (RUSTSEC-2024-0384) via `httpclient`, `rustls-pemfile`
   2.2.0 (RUSTSEC-2025-0134) via `httpclient`, `servicemanager` and `mailbox-model`, and `unsafe-libyaml` 0.2.11
@@ -45,6 +47,13 @@ the looper then marks it `promoted` or `declined` here with the date.
   repository (#14), but tonight's scan run directory had no `security-mailbox` report in it. So the scan audited
   `Cargo.lock` itself again (and found #16). Fetching the report into the scan's run directory is looper's to fix.
   Until then, the "security checks pipeline" proposal above is half done.
+  Nightly scan 2026-11-11: still no report in the run directory (and README still has no "Security checks" section),
+  so the scan audited `Cargo.lock` itself again and found #17 (rustix, RUSTSEC-2026-0486).
+- **The scan cannot run `just gates`** (2026-11-11, nightly scan): `just generate` fails in the scan's runner before
+  building anything: `tacplus build` needs a Docker daemon and gets `failed to connect to the docker API at
+  unix:///var/run/docker.sock`. So tonight nobody checked whether the gates pass on main. The runner needs a
+  daemon, or the scan should hand the gates to the build pipeline the way issue runs do (`repo-looper --build`).
+  That is looper's to fix.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

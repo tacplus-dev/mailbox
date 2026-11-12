@@ -57,6 +57,9 @@ the looper then marks it `promoted` or `declined` here with the date.
   half is done. But it is a report of 5541bf4, #17's relock (a child of main 3d1eb65 that is not on main), not of
   main. So the scan ran `osv-scanner` on main's `Cargo.lock` too, and the only difference is rustix 1.1.4 (#17).
   README still has no "Security checks" section.
+  Nightly scan 2026-11-12 (second run, 20261112T101503Z): the same report, still of 5541bf4 and not main (f8d3aaa).
+  README has no "Trace propagation" section either, though the scan is pointed at both. A short section for each
+  (what runs, where its report lives, the `// trace: unrelated: <why>` marker) would make the README match.
 - **The scan cannot run `just gates`** (2026-11-11, nightly scan): `just generate` fails in the scan's runner before
   building anything: `tacplus build` needs a Docker daemon and gets `failed to connect to the docker API at
   unix:///var/run/docker.sock`. So tonight nobody checked whether the gates pass on main. The runner needs a

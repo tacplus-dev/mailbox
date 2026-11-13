@@ -41,6 +41,8 @@ the looper then marks it `promoted` or `declined` here with the date.
   older are backports). It carries "Rust/TypeScript chassis: no hardcoded floors that admit known advisories"
   (tacplus#338, PR tacplus#472). So a pin to 2.6.10 may let the generated chassis require a fixed rmcp itself, not
   only the relock #16 makes. tacplus#368 is still open.
+  Nightly scan 2026-11-13: v2.6.11 (2026-11-13) is now the newest. 2.6 is still the latest line (2.5.23 and older
+  are backports).
 - **Unmaintained crates in the generated chassis** (2026-11-10, nightly scan): `osv-scanner` on `Cargo.lock` warns on
   `backoff` 0.4.0 (RUSTSEC-2025-0012) and `instant` 0.1.13 (RUSTSEC-2024-0384) via `httpclient`, `rustls-pemfile`
   2.2.0 (RUSTSEC-2025-0134) via `httpclient`, `servicemanager` and `mailbox-model`, and `unsafe-libyaml` 0.2.11
@@ -69,6 +71,10 @@ the looper then marks it `promoted` or `declined` here with the date.
   LOOPER_DOCKER_BROKER, looper#68): `docker version` reaches it, but its side has no daemon at
   /var/run/docker.sock either. The gates on main went unchecked again. Related: build jobs do not report
   (tacplus-dev/looper#113, open), which is what keeps #16 from landing.
+  Nightly scan 2026-11-13 (20261113T093604Z): the same. `docker info` through the broker gets no daemon at
+  /var/run/docker.sock, so the gates on main (c881988) went unchecked for the third night. The security report
+  is still of 5541bf4, not main. `osv-scanner` on main's `Cargo.lock` finds only rmcp (#16), rustix (#17) and the
+  unmaintained crates above.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

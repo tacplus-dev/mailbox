@@ -43,6 +43,9 @@ the looper then marks it `promoted` or `declined` here with the date.
   only the relock #16 makes. tacplus#368 is still open.
   Nightly scan 2026-11-13: v2.6.11 (2026-11-13) is now the newest. 2.6 is still the latest line (2.5.23 and older
   are backports).
+  Nightly scan 2026-11-15: v2.6.12 (2026-11-14; its notes name only tacplus#329, gates refusing a committed merge
+  conflict marker, the same as v2.6.11's) is now the newest. 2.6 is still the latest line (2.5.24 and older are
+  backports), so the floor follows the rule; the pin is still 2.6.1. tacplus#368 (#15) is still open.
 - **Unmaintained crates in the generated chassis** (2026-11-10, nightly scan): `osv-scanner` on `Cargo.lock` warns on
   `backoff` 0.4.0 (RUSTSEC-2025-0012) and `instant` 0.1.13 (RUSTSEC-2024-0384) via `httpclient`, `rustls-pemfile`
   2.2.0 (RUSTSEC-2025-0134) via `httpclient`, `servicemanager` and `mailbox-model`, and `unsafe-libyaml` 0.2.11
@@ -62,6 +65,17 @@ the looper then marks it `promoted` or `declined` here with the date.
   Nightly scan 2026-11-12 (second run, 20261112T101503Z): the same report, still of 5541bf4 and not main (f8d3aaa).
   README has no "Trace propagation" section either, though the scan is pointed at both. A short section for each
   (what runs, where its report lives, the `// trace: unrelated: <why>` marker) would make the README match.
+  Nightly scan 2026-11-15 (20261115T101241Z): the report is now of 278a8eb, #18's branch `looper/mailbox-18` (four
+  lines of STATE.md over main e49a69f, so its `Cargo.lock` is main's), from a build that failed on 2026-11-13 in
+  tacplus-dev/looper#144's window (pipeline 3065797614; main e49a69f itself has no build status at all, pending with
+  nothing reported, tacplus-dev/looper#113). Two consequences, both looper's: the security job ran on a tree WITHOUT the
+  generated crates, so it lists `clippy: exited 101: no matching package named logger` as a Problem (not a mailbox
+  bug: `Cargo.toml` path-depends on `target/generated-sources`, as every tacplus Rust service does; the same cause
+  tacplus-dev/looper#126 fixed for cargo-deny), and cargo-deny read `Cargo.lock` alone, so #15's 22 unlicensed
+  findings are absent from the report because they were not analyzed, not because they are fixed. A security job
+  whose gates job produced no generated tree should say so rather than report the compile errors as findings. The
+  report's two `new` findings are rustix (#17) and quinn-udp RUSTSEC-2026-0538, filed as #19. README still has no
+  "Security checks" or "Trace propagation" section.
 - **The scan cannot run `just gates`** (2026-11-11, nightly scan): `just generate` fails in the scan's runner before
   building anything: `tacplus build` needs a Docker daemon and gets `failed to connect to the docker API at
   unix:///var/run/docker.sock`. So tonight nobody checked whether the gates pass on main. The runner needs a
@@ -75,6 +89,13 @@ the looper then marks it `promoted` or `declined` here with the date.
   /var/run/docker.sock, so the gates on main (c881988) went unchecked for the third night. The security report
   is still of 5541bf4, not main. `osv-scanner` on main's `Cargo.lock` finds only rmcp (#16), rustix (#17) and the
   unmaintained crates above.
+  Nightly scan 2026-11-15 (20261115T101241Z): the same, the fourth night: `docker info` reaches the client but
+  `failed to connect to the docker API at unix:///var/run/docker.sock`, so `just generate` fails before building
+  and the gates on main (e49a69f) went unchecked. No build of main has reported either (its commit status is
+  pending with nothing attached), and the only build near main, 278a8eb on #18's branch, failed on 2026-11-13 in
+  tacplus-dev/looper#144's window. `osv-scanner` on main's `Cargo.lock`: rmcp (#16), rustix (#17), quinn-udp (#19)
+  and the unmaintained crates above; `cargo audit` is not installed in the runner and `cargo deny` has no advisory
+  database offline, so osv-scanner is the auditor the scan has.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

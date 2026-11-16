@@ -96,6 +96,11 @@ the looper then marks it `promoted` or `declined` here with the date.
   tacplus-dev/looper#144's window. `osv-scanner` on main's `Cargo.lock`: rmcp (#16), rustix (#17), quinn-udp (#19)
   and the unmaintained crates above; `cargo audit` is not installed in the runner and `cargo deny` has no advisory
   database offline, so osv-scanner is the auditor the scan has.
+  Nightly scan 2026-11-16 (20261116T094014Z): the same, the fifth night: `just gates` stops in `generate`
+  (`failed to connect to the docker API at unix:///var/run/docker.sock`), so the gates on main (def404b) went
+  unchecked. The security report is of 852b214 on `looper/mailbox-16` (rmcp 3.9.0), not main, which is why it lists
+  no rmcp; main's `Cargo.lock` still has rmcp 3.4.1 (#16), rustix 1.1.4 (#17) and quinn-udp 0.5.15 (#19), per
+  `osv-scanner`.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

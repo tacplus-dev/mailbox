@@ -1,0 +1,13 @@
+# The findings this repository accepts, each until its expiry, in the form looper-scan reads
+# (tacplus-dev/looper#49: exactly id, reason, decided_by and expires, YYYY-MM-DD; one id per entry). An expired
+# entry fails the security checks, and so does the finding it accepted.
+#
+# DS-0026 (trivy, LOW), "No HEALTHCHECK defined" in the Dockerfile: the distroless image has no shell, and
+# Kubernetes ignores a Docker HEALTHCHECK; health is reported through the chassis (check_health, the
+# healthreporter) and probed by Kubernetes. Jody (hub, 2026-11-17, #20). looper-scan matches an exception by id
+# alone, so this accepts DS-0026 in any Dockerfile of this repository.
+exceptions:
+  - id: DS-0026
+    reason: "No HEALTHCHECK: the distroless image has no shell and Kubernetes probes the service, not a Docker HEALTHCHECK (#20)"
+    decided_by: jodydadescott (hub, 2026-11-17, #20)
+    expires: 2027-05-17

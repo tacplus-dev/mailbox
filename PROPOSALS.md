@@ -119,6 +119,13 @@ the looper then marks it `promoted` or `declined` here with the date.
   findings the change adds over main's own report. Or a `gates.yaml` could map the planning files (STATE.md,
   PROPOSALS.md) to a light gate set without the security floor, as #18's run suggested. Either one would let
   fixes stop waiting on an unrelated upstream issue.
+- **Move the pinned base digest, and its baseline, by a bot** (2026-11-17, #20): the Dockerfile now pins
+  `cc-debian13` by digest, and security-baseline.json records its 57 unfixed advisories under that reference (trivy's
+  `where` names the image as the Dockerfile writes it). A distroless rebuild that fixes them reaches mailbox only
+  when someone moves the digest, and each move must move the baseline too: otherwise every advisory the new base
+  still carries is reported new again. A scheduled job (Renovate's `docker` digest pinning, or the nightly scan
+  itself) could propose the move with the regenerated image entries in one commit, for stratum and kernel as well
+  (tacplus-dev/stratum#40, tacplus-dev/kernel#67).
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

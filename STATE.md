@@ -1,6 +1,6 @@
 # State: mailbox
 
-Overwritten to stay current (loopers and agents). Last updated: 2026-11-08 by looper (#14).
+Overwritten to stay current (loopers and agents). Last updated: 2026-11-17 by looper (#20).
 
 - **Version / line:** 0.1 (v0.1.0, a source tag, Jody 2026-11-07; v0.1.1 the patch for #14); tacplus floor 2.6, pinned to
   2.6.1 and its build image by digest in `tacplus.lock` (#13), so the build pipeline builds it (#14)
@@ -19,5 +19,7 @@ Overwritten to stay current (loopers and agents). Last updated: 2026-11-08 by lo
   tacplus-dev/tacplus#313). The lockfile is relocked on tacplus 2.5.3: rsa and crypto-bigint are gone (#5, #8). The build's security
   floor still fails on generated code only: cargo-deny's unlicensed generated crates (#15, needs-decision) and
   gitleaks in the generated tree (tacplus-dev/looper#108); the hand-written findings are fixed (#14: no committed
-  test key, the image runs as `nonroot`).
+  test key, the image runs as `nonroot`). The release image's base is pinned by digest (#20); its 57 unfixed
+  base-image advisories are baselined under that digest (security-baseline.json), and DS-0026 is accepted until
+  2027-05-17 (security-exceptions.yaml).
 - **Blocked on:** a green security floor on #15 and tacplus-dev/looper#108; #12 (the reader's `trace_id`) on tacplus-dev/tacplus#313.

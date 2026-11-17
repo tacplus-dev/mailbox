@@ -46,6 +46,8 @@ the looper then marks it `promoted` or `declined` here with the date.
   Nightly scan 2026-11-15: v2.6.12 (2026-11-14; its notes name only tacplus#329, gates refusing a committed merge
   conflict marker, the same as v2.6.11's) is now the newest. 2.6 is still the latest line (2.5.24 and older are
   backports), so the floor follows the rule; the pin is still 2.6.1. tacplus#368 (#15) is still open.
+  Nightly scan 2026-11-17: v2.6.13 (2026-11-15) is now the newest. 2.6 is still the latest line (no 2.7; 2.5.25 and
+  older are backports). tacplus#368 is still open.
 - **Unmaintained crates in the generated chassis** (2026-11-10, nightly scan): `osv-scanner` on `Cargo.lock` warns on
   `backoff` 0.4.0 (RUSTSEC-2025-0012) and `instant` 0.1.13 (RUSTSEC-2024-0384) via `httpclient`, `rustls-pemfile`
   2.2.0 (RUSTSEC-2025-0134) via `httpclient`, `servicemanager` and `mailbox-model`, and `unsafe-libyaml` 0.2.11
@@ -76,6 +78,11 @@ the looper then marks it `promoted` or `declined` here with the date.
   whose gates job produced no generated tree should say so rather than report the compile errors as findings. The
   report's two `new` findings are rustix (#17) and quinn-udp RUSTSEC-2026-0538, filed as #19. README still has no
   "Security checks" or "Trace propagation" section.
+  Nightly scan 2026-11-17 (20261117T094302Z): this half is done. The report is of main ecbfd4f with the generated
+  tree present: #15's 22 unlicensed crates are back, and osv-scanner's findings match a local `osv-scanner` run on
+  main's `Cargo.lock` (rmcp #16, rustix #17, quinn-udp #19, the unmaintained crates). For the first time it scans the
+  image too, and its 59 new trivy findings are #20. README still has no "Security checks" or "Trace propagation"
+  section.
 - **The scan cannot run `just gates`** (2026-11-11, nightly scan): `just generate` fails in the scan's runner before
   building anything: `tacplus build` needs a Docker daemon and gets `failed to connect to the docker API at
   unix:///var/run/docker.sock`. So tonight nobody checked whether the gates pass on main. The runner needs a
@@ -101,6 +108,17 @@ the looper then marks it `promoted` or `declined` here with the date.
   unchecked. The security report is of 852b214 on `looper/mailbox-16` (rmcp 3.9.0), not main, which is why it lists
   no rmcp; main's `Cargo.lock` still has rmcp 3.4.1 (#16), rustix 1.1.4 (#17) and quinn-udp 0.5.15 (#19), per
   `osv-scanner`.
+  Nightly scan 2026-11-17 (20261117T094302Z): done, as proposed. The scan now reads the nightly build's verdict
+  (tacplus-dev/build, looper#73): `result pass` on ecbfd4f, this checkout's HEAD (pipeline 3077067373, 51 tests
+  passed, `gates: ok`).
+- **A fix that clears findings should land on a floor already red with others** (2026-11-17, nightly scan; #16, #17,
+  #18, #19): the gates pass on main, but the security floor fails on #15's 22 generated crates, which wait on
+  tacplus-dev/tacplus#368. Since nothing merges without a green floor, #16 (which removes the only HIGH, rmcp) cannot
+  land, and neither can #18 (four lines of STATE.md) or the relocks #17 and #19. The manager already refused #16 on
+  #15's findings alone (2026-11-15, pipeline 3071229155). Two options, both looper's. A land could fail only on
+  findings the change adds over main's own report. Or a `gates.yaml` could map the planning files (STATE.md,
+  PROPOSALS.md) to a light gate set without the security floor, as #18's run suggested. Either one would let
+  fixes stop waiting on an unrelated upstream issue.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

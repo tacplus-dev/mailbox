@@ -119,6 +119,13 @@ the looper then marks it `promoted` or `declined` here with the date.
   findings the change adds over main's own report. Or a `gates.yaml` could map the planning files (STATE.md,
   PROPOSALS.md) to a light gate set without the security floor, as #18's run suggested. Either one would let
   fixes stop waiting on an unrelated upstream issue.
+- **A finding first seen in a land build should still be filed** (2026-11-18, nightly scan; #22): the nightly scan
+  files only the findings its report marks `new`, and `new` is measured against the previous run of any kind, lands
+  included. chrono's RUSTSEC-2026-0543 (advisory updated 2026-11-17T10:15Z) was probably first reported by the
+  2026-11-17 land build of #20, which no scan files from. Tonight's nightly then reported it `new: false`, so by the
+  rule it went unfiled, and no mailbox issue held it until #22. Either option would fix this, and both are looper's
+  (looper-scan, README: Security checks). `new` could be measured against the previous nightly only. Or the scan
+  could also file a finding that is not `new` when no open issue of the repository names its id.
 
 ## Promoted / declined
 - **Which per-tenant Stratum mailbox writes to** (2026-10-29, #7): decided 2026-10-30 in #8 (Jody): the tenant of the

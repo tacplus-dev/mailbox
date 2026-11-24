@@ -1,0 +1,250 @@
+= init
+> Bash cd /builds/looper/mailbox/issues/25; /usr/local/bin/repo-looper --repo mailbox --issue-text 25 | tail -20; git log --oneline -3 origin/looper/mailbox-25 2>/dev/null; ls; cat STATE.md | head -50; find . -name 'Dockerfile*' -not -path './.git/*'; cat justfile
+< <<issue-text nonce=[redacted] author=jodydadescott association=MEMBER role=direction>> # Release image base pinned by digest, not the floating tag  The release Dockerfile builds from a floating tag: `FROM gcr.io/distroless/cc-debian13`. Jody's decision `decisions/security-gates...
+> Bash cd /builds/looper/mailbox/issues/25; cat Dockerfile; ls src tests 2>/dev/null; grep -rn "Dockerfile" --include=*.rs --include=*.md . | grep -v '^./target' | head -20; gh api repos/tacplus-dev/gateway/contents/Dockerfile -H 'Accept: application/vnd.github.raw'; gh api 'repos/tacplus-dev/gateway/git/t...
+< # Runtime base per #2 (hub, 2026-10-27): distroless. FROM gcr.io/distroless/cc-debian13 COPY target/release/mailbox /usr/local/bin/mailbox # distroless's nonroot user (65532): the service needs no root (#14). USER nonroot ENTRYPOINT ["mailbox"] src: gmail.rs gmail_tests.rs main.rs service.rs service...
+> Bash cd /builds/looper/mailbox/issues/25; gh api repos/tacplus-dev/gateway/contents/tests/release.rs -H 'Accept: application/vnd.github.raw' | head -60; gh search code --owner tacplus-dev "sha256" --filename '*.rs' 2>/dev/null | head; cat Cargo.toml; git tag; cat PROVENANCE.md | head -30
+< //! The release rules (ci/release-notes.sh, ci/release-latest.sh), run against fixture repositories: which //! commits a release's notes list, and whether its GitHub release is Latest, so an older line's patch (or an //! older release published late) never takes Latest from the highest release.  use...
+= thinking_tokens
+= thinking_tokens
+> Bash gh api repos/tacplus-dev/roadmap/contents/decisions/security-gates-ship-only-2026-11-23.md -H 'Accept: application/vnd.github.raw'; for r in messaging stratum oauth; do echo "== $r"; gh api repos/tacplus-dev/$r/contents/Dockerfile -H 'Accept: application/vnd.github.raw' 2>/dev/null | grep -n FROM; d...
+< # Security gates block on what ships; pipeline tooling is fixed nightly (2026-11-23)  **Status:** decided (Jody, 2026-11-23: "yes go with your recommendations"). Builds on Jody 2026-11-20, "we dont want to let security slow us down at all right now", and supersedes the parts of the security-floor de...
+Now resolve the digest of the current tag via the registry API.
+> Bash for t in latest nonroot; do curl -sSI -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' https://gcr.io/v2/distroless/cc-debian13/manifests/$t | grep -i -E 'digest|content-type|^HTTP'; done
+< HTTP/2 200  content-type: application/vnd.oci.image.index.v1+json docker-content-digest: sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765 x-content-type-options: nosniff HTTP/2 200  content-type: application/vnd.oci.image.index.v1+json docker-content-digest: sha256:532c7...
+= thinking_tokens
+= thinking_tokens
+> Bash curl -sS -H 'Accept: application/vnd.oci.image.index.v1+json' https://gcr.io/v2/distroless/cc-debian13/manifests/latest | sha256sum
+< dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765  -
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Write /builds/looper/mailbox/issues/25/tests/dockerfile.rs
+< File created successfully at: /builds/looper/mailbox/issues/25/tests/dockerfile.rs (file state is current in your context — no need to Read it back)
+= thinking_tokens
+= thinking_tokens
+> Bash cd /tmp && mkdir -p df25 && cd df25 && which rustc && CARGO_MANIFEST_DIR=/builds/looper/mailbox/issues/25 rustc --edition 2021 --test /builds/looper/mailbox/issues/25/tests/dockerfile.rs -o t 2>&1 | tail -5 && ./t
+< Exit code 101 /usr/local/cargo/bin/rustc  running 3 tests test a_digest_passes ... FAILED test a_floating_tag_is_caught ... ok test every_from_is_pinned_by_digest ... FAILED  failures:  ---- a_digest_passes stdout ----  thread 'a_digest_passes' (920) panicked at /builds/looper/mailbox/issues/25/test...
+= thinking_tokens
+= thinking_tokens
+Fix the stage check: look up earlier stages before recording this one's alias.
+> Edit /builds/looper/mailbox/issues/25/tests/dockerfile.rs
+< The file /builds/looper/mailbox/issues/25/tests/dockerfile.rs has been updated successfully. (file state is current in your context — no need to Read it back)
+> Bash cd /tmp/df25 && CARGO_MANIFEST_DIR=/builds/looper/mailbox/issues/25 rustc --edition 2021 --test /builds/looper/mailbox/issues/25/tests/dockerfile.rs -o t 2>&1 | tail -5 && ./t 2>&1 | grep -E '^test |FROM'
+< test a_digest_passes ... ok test a_floating_tag_is_caught ... ok test every_from_is_pinned_by_digest ... FAILED Dockerfile: FROM without @sha256: ["gcr.io/distroless/cc-debian13"] test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s Shell cwd was reset to...
+Fails as it should. Now pin the Dockerfile.
+> Edit /builds/looper/mailbox/issues/25/Dockerfile
+< The file /builds/looper/mailbox/issues/25/Dockerfile has been updated successfully.
+> Bash cd /tmp/df25 && ./t 2>&1 | grep -E '^test '; rm -rf /tmp/df25; cd /builds/looper/mailbox/issues/25 && git add -A && git commit -qm "Pin the release image's base by digest, not the floating tag (#25)  A rebuild of the same commit could ship a different, unscanned base (roadmap decisions/security-gate...
+< test a_digest_passes ... ok test a_floating_tag_is_caught ... ok test every_from_is_pinned_by_digest ... ok test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s 1086
+= thinking_tokens
+= thinking_tokens
+> Bash cd /builds/looper/mailbox/issues/25; git log --oneline v0.1.1..origin/main | cat; ls -a; ls .github/workflows 2>/dev/null; git branch -r | cat; grep -n -i -A5 release README.md | head -40
+< dbfe3d8 PROPOSALS.md: the nightly scan's proposals (looper) de13708 PROPOSALS.md: the nightly scan's proposals (looper) ecbfd4f PROPOSALS.md: the nightly scan's proposals (looper) def404b PROPOSALS.md: the nightly scan's proposals (looper) e49a69f PROPOSALS.md: the nightly scan's proposals (looper) ...
+= thinking_tokens
+= thinking_tokens
+> Bash sleep 240; cat /tmp/build25.log | tail -20
+< <tool_use_error>Blocked: sleep 240 followed by: cat /tmp/build25.log tail -20. To wait for a condition, use Monitor with an until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command you started, use run_in_background: true. Do not chain shorter sleeps to work around this block.</too...
+> ToolSearch {"query":"select:Monitor","max_results":1}
+< 
+> Bash until ! kill -0 1086 2>/dev/null; do sleep 10; done; tail -25 /tmp/build25.log
+= background_tasks_changed
+= task_started
+< Command running in background with ID: boojj6ym4. Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/boojj6ym4.output. You will be notified when it completes. To check interim output, use Rea...
+= thinking_tokens
+= thinking_tokens
+> Read /tmp/build25.log
+< 1	[2026-11-24T17:15:38Z] checkpoint of #25 (a build) pushed to looper/mailbox-25:  4 files changed, 279 insertions(+), 2 deletions(-) 2	[2026-11-24T17:15:38Z] build requested: mailbox 7a8a195, the gates full (no gates.yaml) 3	the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109851389 ...
+The fix is committed and its build job is running with the full gates. While it runs, I'm checking the commit's contents: the checkpoint reported more files than I expected.
+> Bash cd /builds/looper/mailbox/issues/25; git show --stat HEAD | cat; git status --short
+< commit 7a8a195e90e6de962d6b8fc46070c73807076040 Author: jodydadescott <jody@thescottsweb.com> Date:   Tue Nov 24 17:15:34 2026 +0000      Pin the release image's base by digest, not the floating tag (#25)          A rebuild of the same commit could ship a different, unscanned base     (roadmap decis...
+The commit holds only my two files. The larger count was against the branch's older checkpoint. Now I'm waiting on the build.
+> Bash until ! kill -0 1086 2>/dev/null; do sleep 15; done; tail -15 /tmp/build25.log
+= task_started
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: bnau7geqw). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/bnau7geqw.output. You will be notified whe...
+> Bash until ! kill -0 1086 2>/dev/null; do sleep 15; done; tail -15 /tmp/build25.log
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= task_updated
+= task_notification
+= background_tasks_changed
+= task_notification
+< [2026-11-24T17:15:38Z] checkpoint of #25 (a build) pushed to looper/mailbox-25:  4 files changed, 279 insertions(+), 2 deletions(-) [2026-11-24T17:15:38Z] build requested: mailbox 7a8a195, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109851389 of mai...
+The build job's runner was lost, which is an infrastructure fault, not a gate failure. I'm retrying the build.
+> Bash cd /builds/looper/mailbox/issues/25; /usr/local/bin/repo-looper --repo mailbox --issue 25 --build > /tmp/build25b.log 2>&1; echo exit $?; tail -8 /tmp/build25b.log
+= background_tasks_changed
+= task_started
+< Command running in background with ID: ba10ou4hj. Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output. You will be notified when it completes. To check interim output, use Rea...
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-43...
+= task_started
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: b3hco6sl6). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/b3hco6sl6.output. You will be notified whe...
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-43...
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: b1d0zeadx). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/b1d0zeadx.output. You will be notified whe...
+> Bash cat /tmp/build25b.log
+< [2026-11-24T17:29:38Z] checkpoint of #25 (a build) pushed to looper/mailbox-25:  4 files changed, 321 insertions(+), 2 deletions(-) [2026-11-24T17:29:38Z] build requested: mailbox 7a8a195, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 of mai...
+The second build is still running (over 11 minutes). Still waiting on it.
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; cat /tmp/build25b.log | tail -5; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-m...
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: bvilp9m38). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/bvilp9m38.output. You will be notified whe...
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; tail -4 /tmp/build25b.log; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox...
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: b8ebkwdcb). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/b8ebkwdcb.output. You will be notified whe...
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; tail -4 /tmp/build25b.log; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox...
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: bjoro0h73). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/bjoro0h73.output. You will be notified whe...
+> Bash tail -3 /tmp/build25b.log
+< [2026-11-24T17:49:58Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 21m [2026-11-24T18:00:07Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running si...
+> Bash until grep -q '^exit' /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/ba10ou4hj.output; do sleep 15; done; tail -4 /tmp/build25b.log; cat /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox...
+= task_started
+= task_updated
+= task_notification
+= background_tasks_changed
+= task_updated
+= task_notification
+= background_tasks_changed
+= background_tasks_changed
+= task_updated
+< Command did not complete within its 600s timeout and was moved to the background (ID: bnwup7990). Output is being written to: /builds/looper/mailbox/homes/looper-25/tmp/claude-61000/-builds-looper-mailbox-issues-25/f477d891-0e9f-4360-9ae6-2d2251f0e0b1/tasks/bnwup7990.output. You will be notified whe...
+= thinking_tokens
+= thinking_tokens
+My background build waiter hit its time limit and was stopped. The pipeline itself is unaffected, so I'm starting `--build` again detached with nohup to pick up the verdict.
+> Bash cd /builds/looper/mailbox/issues/25; nohup sh -c '/usr/local/bin/repo-looper --repo mailbox --issue 25 --build; echo exit $?' > /tmp/build25c.log 2>&1 & echo $!
+< 17238
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; cat /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T18:30:20Z] checkpoint of #25 (a build) pushed to looper/mailbox-25:  4 files changed, 379 insertions(+), 2 deletions(-) [2026-11-24T18:30:20Z] build requested: mailbox 7a8a195, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 of mai...
+= task_updated
+= task_notification
+= background_tasks_changed
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T18:30:20Z] build requested: mailbox 7a8a195, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 of mailbox 7a8a195, the gates full on base dbfe3d8 (reused: queued or running: this key's build, looper#134) [2026-11-24T18:40:31Z] waitin...
+The pipeline has been running for 1h11m, while the first build took 13 minutes before its runner was lost. I'm checking the pipeline's jobs directly.
+> Bash curl -sS "https://gitlab.com/api/v4/projects/tacplus-dev%2Fbuild/pipelines/3109904727/jobs" | python3 -I -c 'import json,sys for j in json.load(sys.stdin): print(j["name"], j["status"], j.get("started_at"), j.get("duration"))' 2>&1 | head
+< Traceback (most recent call last):   File "<string>", line 2, in <module>     for j in json.load(sys.stdin): print(j["name"], j["status"], j.get("started_at"), j.get("duration"))                                          ~^^^^^^^^ TypeError: string indices must be integers, not 'str'
+The pipeline is private, so I can't see its jobs. I'll keep waiting on repo-looper's verdict.
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 of mailbox 7a8a195, the gates full on base dbfe3d8 (reused: queued or running: this key's build, looper#134) [2026-11-24T18:40:31Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109...
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T18:40:31Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 1h11m [2026-11-24T18:50:39Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T18:50:39Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 1h21m [2026-11-24T19:00:48Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T19:00:48Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 1h31m [2026-11-24T19:11:01Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T19:11:01Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 1h42m [2026-11-24T19:21:15Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -3 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T19:21:15Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 1h52m [2026-11-24T19:31:24Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -2 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T19:41:34Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 2h12m [2026-11-24T19:51:43Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+> Bash timeout 590 sh -c 'until grep -q "^exit" /tmp/build25c.log; do sleep 15; done'; tail -2 /tmp/build25c.log
+= task_started
+= task_notification
+< [2026-11-24T19:51:43Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running since 2h22m [2026-11-24T20:01:52Z] waiting for the verdict of the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3109904727 on 7a8a195: running ...
+= thinking_tokens
+= thinking_tokens
+Still no verdict after 2h33m, so I'm stopping my waiter and queueing the land.
+> Bash cd /builds/looper/mailbox/issues/25; kill 17238; /usr/local/bin/repo-looper --repo mailbox --issue 25 --land 2>&1 | tail -10
+= task_started
+= task_notification
+< [2026-11-24T20:09:31Z] checkpoint of #25 (land queued) pushed to looper/mailbox-25:  5 files changed, 453 insertions(+), 2 deletions(-) [2026-11-24T20:09:32Z] queued: the manager of mailbox lands looper/mailbox-25 in its next batch, with the lands queued before it (the merge train, looper#86), and s...
+> Bash cd /builds/looper/mailbox/issues/25; /usr/local/bin/repo-looper --repo mailbox --issue 25 --checkpoint "Land queued: 7a8a195 pins the Dockerfile FROM to gcr.io/distroless/cc-debian13:latest@sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765 (the tag's digest on 2026-11-24, read ...
+< [2026-11-24T20:09:42Z] checkpoint of #25 (a step) pushed to looper/mailbox-25:  5 files changed, 457 insertions(+), 2 deletions(-)
+I've queued the fix to land, but no build has passed on it yet. My two full-gate builds never gave a verdict, so the manager's build of the batch will be the first real check. Its verdict will appear as a comment on the issue.
+
+**The change (commit 7a8a195):**
+- **`Dockerfile`:** the base is now `gcr.io/distroless/cc-debian13:latest@sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765`. That is the digest the `latest` tag pointed to today; I read it from gcr.io and checked it against the manifest's own hash. The comment above the line says nightly maintenance moves it from now on (tacplus-dev/looper#234).
+- **`tests/dockerfile.rs`:** a new test that fails on any `FROM` without `@sha256:` in a Dockerfile at the repository root. It also catches a `FROM ${BASE_IMAGE}` whose default is unpinned, and skips a `FROM` that names an earlier build stage.
+
+I couldn't run `cargo test` here because it needs the generated sources, so I compiled the test file on its own with `rustc`. It failed on the old Dockerfile and passed once the base was pinned.
+
+**The builds:**
+- The first build lost its runner after about 13 minutes.
+- The second was still running with no result after 2h33m. Rather than run out the clock, I stopped waiting and queued the land.
+
+**Left for the next run, after the verdict:**
+- **If it merges:** run the full `just gates` on main and, if they pass, tag `v0.1.2` there and push the tag. Then comment on the issue with the results and close it. No features have landed since `v0.1.1` and there are no release branches, so the patch comes from main and needs no backports.
+- **If it comes back red:** fix it and land again.
+
+The messaging and stratum Dockerfiles also build from floating distroless tags. I left them alone because they belong to other repositories and this issue doesn't cover them.
+= success: I've queued the fix to land, but no build has passed on it yet. My two full-gate builds never gave a verdict, so the manager's build of the batch will be the first real check. Its verdict will appear as a comment on the issue.
+
+**The change (commit 7a8a195):**
+- **`Dockerfile`:** the base is now `gcr.io/distroless/cc-debian13:latest@sha256:dac90a25ffe03ebaace90cda886b081e61ab6cd77ac47eda51f7bcc15c320765`. That is the digest the `latest` tag pointed to today; I read it from gcr.io and checked it against the manifest's own hash. The comment above the line says nightly maintenance moves it from now on (tacplus-dev/looper#234).
+- **`tests/dockerfile.rs`:** a new test that fails on any `FROM` without `@sha256:` in a Dockerfile at the repository root. It also catches a `FROM ${BASE_IMAGE}` whose default is unpinned, and skips a `FROM` that names an earlier build stage.
+
+I couldn't run `cargo test` here because it needs the generated sources, so I compiled the test file on its own with `rustc`. It failed on the old Dockerfile and passed once the base was pinned.
+
+**The builds:**
+- The first build lost its runner after about 13 minutes.
+- The second was still running with no result after 2h33m. Rather than run out the clock, I stopped waiting and queued the land.
+
+**Left for the next run, after the verdict:**
+- **If it merges:** run the full `just gates` on main and, if they pass, tag `v0.1.2` there and push the tag. Then comment on the issue with the results and close it. No features have landed since `v0.1.1` and there are no release branches, so the patch comes from main and needs no backports.
+- **If it comes back red:** fix it and land again.
+
+The messaging and stratum Dockerfiles also build from floating distroless tags. I left them alone because they belong to other repositories and this issue doesn't cover them.
+= usage: {"claude-opus-5-5":{"inputTokens":84,"outputTokens":12146,"cacheReadInputTokens":1954235,"cacheCreationInputTokens":47705,"webSearchRequests":0,"costUSD":1.0157429999999998,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":1959,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}
